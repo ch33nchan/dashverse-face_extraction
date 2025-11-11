@@ -19,8 +19,7 @@ from tqdm import tqdm
 import logging
 import sys
 import traceback
-import multiprocessing as mp
-from functools import partial
+import ray
 
 warnings.filterwarnings('ignore')
 
@@ -38,14 +37,21 @@ def setup_logging(output_dir):
     return logging.getLogger(__name__)
 
 
-def get_video_files(videos_dir):
+def get_video_files(videos_dir, max_folders=None):
     video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv']
     video_files = []
     
-    for root, dirs, files in os.walk(videos_dir):
-        for file in files:
-            if any(file.lower().endswith(ext) for ext in video_extensions):
-                video_files.append(os.path.join(root, file))
+    subdirs = [d for d in os.listdir(videos_dir) if os.path.isdir(os.path.join(videos_dir, d))]
+    
+    if max_folders:
+        subdirs = subdirs[:max_folders]
+    
+    for subdir in subdirs:
+        subdir_path = os.path.join(videos_dir, subdir)
+        for root, dirs, files in os.walk(subdir_path):
+            for file in files:
+                if any(file.lower().endswith(ext) for ext in video_extensions):
+                    video_files.append(os.path.join(root, file))
     
     return video_files
 
@@ -364,7 +370,8 @@ CHARACTER APPEARANCES IN TEST FRAMES:
     return report
 
 
-def process_single_video(video_path, output_root, args, gpu_id=0):
+@ray.remote(num_gpus=0.25)
+def process_single_video(video_path, output_root, args):
     try:
         video_name = Path(video_path).stem
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -374,36 +381,33 @@ def process_single_video(video_path, output_root, args, gpu_id=0):
         logger = setup_logging(output_dir)
         logger.info(f"Processing video: {video_path}")
         logger.info(f"Output directory: {output_dir}")
-        logger.info(f"Using GPU: {gpu_id}")
         
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-        provider_options = [{'device_id': gpu_id}, {}]
         
         app = FaceAnalysis(
             name='buffalo_l',
-            providers=providers,
-            provider_options=provider_options
+            providers=providers
         )
-        app.prepare(ctx_id=gpu_id, det_size=(640, 640))
+        app.prepare(ctx_id=0, det_size=(640, 640))
         
         logger.info("Model loaded successfully")
         
         embeddings, frame_indices, face_boxes = extract_faces_from_video(
-            video_path, args.sample_rate, args.min_face_size, app, logger
+            video_path, args['sample_rate'], args['min_face_size'], app, logger
         )
         
         if len(embeddings) == 0:
             logger.warning("No faces found in video")
             return False
         
-        labels = cluster_faces(embeddings, args.dbscan_eps, args.min_cluster_size, logger)
+        labels = cluster_faces(embeddings, args['dbscan_eps'], args['min_cluster_size'], logger)
         
         reference_faces = select_best_reference_faces(embeddings, labels, face_boxes)
         logger.info(f"Selected {len(reference_faces)} reference faces")
         
         reference_images = extract_reference_images(video_path, reference_faces, output_dir, logger)
         
-        test_frames = generate_test_frames_from_video(video_path, args.num_test_frames, output_dir, logger)
+        test_frames = generate_test_frames_from_video(video_path, args['num_test_frames'], output_dir, logger)
         
         viz_dir = f"{output_dir}/visualizations"
         os.makedirs(viz_dir, exist_ok=True)
@@ -412,7 +416,7 @@ def process_single_video(video_path, output_root, args, gpu_id=0):
         frame_matches = []
         
         for frame_idx, frame_path, frame in tqdm(test_frames, desc="Processing test frames"):
-            matches = match_faces_in_frame(frame, reference_faces, args.similarity_threshold, app)
+            matches = match_faces_in_frame(frame, reference_faces, args['similarity_threshold'], app)
             
             frame_matches.append({
                 'frame_idx': int(frame_idx),
@@ -458,34 +462,39 @@ def process_single_video(video_path, output_root, args, gpu_id=0):
 
 
 def process_videos_batch(video_files, output_root, args):
-    num_gpus = args.num_gpus
     total_videos = len(video_files)
     
     print(f"\n{'='*70}")
-    print(f"STARTING BATCH PROCESSING")
+    print(f"STARTING BATCH PROCESSING WITH RAY")
     print(f"{'='*70}")
     print(f"Total videos found: {total_videos}")
-    print(f"GPUs allocated: {num_gpus}")
+    print(f"Using 2 GPUs with fractional allocation (0.25 GPU per task)")
+    print(f"Concurrent pipelines: 8")
     print(f"Processing all videos in directory recursively")
     print(f"{'='*70}\n")
     
-    if num_gpus > 1:
-        print(f"Using {num_gpus} GPUs for parallel processing\n")
-        
-        video_gpu_pairs = []
-        for idx, video_path in enumerate(video_files):
-            gpu_id = idx % num_gpus
-            video_gpu_pairs.append((video_path, output_root, args, gpu_id))
-        
-        with mp.Pool(processes=num_gpus) as pool:
-            results = pool.starmap(process_single_video, video_gpu_pairs)
-    else:
-        print("Using single GPU for sequential processing\n")
-        results = []
-        for idx, video_path in enumerate(video_files, 1):
-            print(f"\nProcessing video {idx}/{total_videos}")
-            result = process_single_video(video_path, output_root, args, gpu_id=0)
-            results.append(result)
+    ray.init(num_gpus=2)
+    
+    args_dict = {
+        'num_test_frames': args.num_test_frames,
+        'sample_rate': args.sample_rate,
+        'min_face_size': args.min_face_size,
+        'similarity_threshold': args.similarity_threshold,
+        'dbscan_eps': args.dbscan_eps,
+        'min_cluster_size': args.min_cluster_size
+    }
+    
+    futures = [process_single_video.remote(video_path, output_root, args_dict) for video_path in video_files]
+    
+    results = []
+    with tqdm(total=total_videos, desc="Overall Progress") as pbar:
+        while len(futures) > 0:
+            done, futures = ray.wait(futures, timeout=1.0)
+            for future in done:
+                results.append(ray.get(future))
+                pbar.update(1)
+    
+    ray.shutdown()
     
     successful = sum(results)
     failed = len(results) - successful
@@ -502,7 +511,7 @@ def process_videos_batch(video_files, output_root, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Batch Face Mapping for Multiple Videos')
+    parser = argparse.ArgumentParser(description='Batch Face Mapping for Multiple Videos with Ray')
     
     parser.add_argument('--videos-dir', type=str, default='/mnt/data/data_hub/movies_dataset/videos',
                         help='Directory containing video files')
@@ -520,8 +529,8 @@ def main():
                         help='DBSCAN epsilon parameter')
     parser.add_argument('--min-cluster-size', type=int, default=3,
                         help='Minimum cluster size for DBSCAN')
-    parser.add_argument('--num-gpus', type=int, default=1,
-                        help='Number of GPUs to use for parallel processing')
+    parser.add_argument('--max-folders', type=int, default=None,
+                        help='Maximum number of folders to process (1, 2, 3, or all)')
     
     args = parser.parse_args()
     
@@ -531,18 +540,21 @@ def main():
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    print("Scanning for video files...")
-    video_files = get_video_files(args.videos_dir)
+    print("Scanning for video files recursively...")
+    video_files = get_video_files(args.videos_dir, args.max_folders)
     
     if len(video_files) == 0:
         print(f"No video files found in {args.videos_dir}")
         sys.exit(1)
     
-    print(f"Found {len(video_files)} video files")
-    for video in video_files:
-        print(f"  - {video}")
+    if args.max_folders:
+        print(f"\nProcessing first {args.max_folders} folder(s) for testing")
     
-    print(f"\nStarting batch processing with {args.num_gpus} GPU(s)...")
+    print(f"\nFound {len(video_files)} video files across subdirectories:")
+    for idx, video in enumerate(video_files, 1):
+        print(f"  {idx}. {video}")
+    
+    print(f"\nProcessing all {len(video_files)} videos with Ray (2 GPUs, 8 concurrent pipelines)...")
     process_videos_batch(video_files, args.output_dir, args)
 
 
