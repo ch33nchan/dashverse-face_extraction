@@ -459,9 +459,18 @@ def process_single_video(video_path, output_root, args, gpu_id=0):
 
 def process_videos_batch(video_files, output_root, args):
     num_gpus = args.num_gpus
+    total_videos = len(video_files)
+    
+    print(f"\n{'='*70}")
+    print(f"STARTING BATCH PROCESSING")
+    print(f"{'='*70}")
+    print(f"Total videos found: {total_videos}")
+    print(f"GPUs allocated: {num_gpus}")
+    print(f"Processing all videos in directory recursively")
+    print(f"{'='*70}\n")
     
     if num_gpus > 1:
-        print(f"Using {num_gpus} GPUs for parallel processing")
+        print(f"Using {num_gpus} GPUs for parallel processing\n")
         
         video_gpu_pairs = []
         for idx, video_path in enumerate(video_files):
@@ -471,9 +480,10 @@ def process_videos_batch(video_files, output_root, args):
         with mp.Pool(processes=num_gpus) as pool:
             results = pool.starmap(process_single_video, video_gpu_pairs)
     else:
-        print("Using single GPU for sequential processing")
+        print("Using single GPU for sequential processing\n")
         results = []
-        for video_path in video_files:
+        for idx, video_path in enumerate(video_files, 1):
+            print(f"\nProcessing video {idx}/{total_videos}")
             result = process_single_video(video_path, output_root, args, gpu_id=0)
             results.append(result)
     
@@ -483,9 +493,11 @@ def process_videos_batch(video_files, output_root, args):
     print(f"\n{'='*70}")
     print(f"BATCH PROCESSING COMPLETE")
     print(f"{'='*70}")
-    print(f"Total videos: {len(video_files)}")
+    print(f"Total videos processed: {total_videos}")
     print(f"Successful: {successful}")
     print(f"Failed: {failed}")
+    print(f"Success rate: {(successful/total_videos)*100:.1f}%")
+    print(f"Output directory: {output_root}")
     print(f"{'='*70}")
 
 
