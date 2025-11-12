@@ -39,9 +39,54 @@ def setup_logging(output_dir):
     return logging.getLogger(__name__)
 
 
-def get_video_files(videos_dir, max_folders=None):
+def get_video_files(videos_dir, max_folders=None, retry_failed=False, output_dir=None):
     video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv']
     video_files = []
+    
+    if retry_failed and output_dir:
+        failed_videos = []
+        
+        for result_dir in os.listdir(output_dir):
+            if result_dir == 'archive_facemap':
+                continue
+            
+            result_path = os.path.join(output_dir, result_dir)
+            if not os.path.isdir(result_path):
+                continue
+            
+            summary_file = os.path.join(result_path, 'summary_report.txt')
+            
+            is_failed = False
+            if not os.path.exists(summary_file):
+                is_failed = True
+            else:
+                with open(summary_file, 'r') as f:
+                    content = f.read()
+                    for line in content.split('\n'):
+                        if 'Total unique characters:' in line:
+                            num_chars = int(line.split(':')[1].strip())
+                            if num_chars <= 2:
+                                is_failed = True
+                            break
+            
+            if is_failed:
+                video_name = '_'.join(result_dir.split('_')[:-2])
+                failed_videos.append(video_name)
+        
+        print(f"Found {len(failed_videos)} failed videos to retry")
+        
+        for root, dirs, files in os.walk(videos_dir):
+            for file in files:
+                if any(file.lower().endswith(ext) for ext in video_extensions):
+                    filepath = os.path.join(root, file)
+                    filename = Path(filepath).stem
+                    
+                    for failed_name in failed_videos:
+                        if failed_name in filename:
+                            video_files.append(filepath)
+                            break
+        
+        return video_files
     
     subdirs = sorted([d for d in os.listdir(videos_dir) if os.path.isdir(os.path.join(videos_dir, d))])
     
@@ -177,6 +222,24 @@ def detect_content_type(video_path):
 def adaptive_face_detection(frame, app, min_face_size, content_type='live_action'):
     width, height = frame.shape[1], frame.shape[0]
     
+    if content_type in ['anime', 'cartoon', 'animation']:
+        anime_faces = detect_anime_faces(frame)
+        
+        if len(anime_faces) > 0:
+            valid_faces = []
+            for face in anime_faces:
+                x1, y1, x2, y2 = face['bbox']
+                if (x2 - x1) >= min_face_size and (y2 - y1) >= min_face_size:
+                    valid_faces.append({
+                        'bbox': face['bbox'],
+                        'embedding': face['embedding'],
+                        'confidence': face['confidence'],
+                        'face_type': 'anime'
+                    })
+            
+            if len(valid_faces) > 0:
+                return valid_faces
+    
     faces_real = app.get(frame)
     
     valid_faces_real = []
@@ -194,27 +257,12 @@ def adaptive_face_detection(frame, app, min_face_size, content_type='live_action
                 'face_type': 'real'
             })
     
-    if len(valid_faces_real) > 0:
-        return valid_faces_real
-    
-    anime_faces = detect_anime_faces(frame)
-    
-    valid_faces_anime = []
-    for face in anime_faces:
-        x1, y1, x2, y2 = face['bbox']
-        if (x2 - x1) >= min_face_size and (y2 - y1) >= min_face_size:
-            valid_faces_anime.append({
-                'bbox': face['bbox'],
-                'embedding': face['embedding'],
-                'confidence': face['confidence'],
-                'face_type': 'anime'
-            })
-    
-    return valid_faces_anime
+    return valid_faces_real
 
 
-def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger):
+def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger, content_type):
     logger.info(f"Opening video: {video_path}")
+    logger.info(f"Content type detected: {content_type}")
     cap = cv2.VideoCapture(video_path)
     
     if not cap.isOpened():
@@ -242,7 +290,7 @@ def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger
             break
         
         if frame_idx % sample_rate == 0:
-            detected_faces = adaptive_face_detection(frame, app, min_face_size)
+            detected_faces = adaptive_face_detection(frame, app, min_face_size, content_type)
             
             for face in detected_faces:
                 x1, y1, x2, y2 = face['bbox']
@@ -406,8 +454,8 @@ def generate_test_frames_from_video(video_path, num_frames, output_dir, logger):
     return saved_frames
 
 
-def match_faces_in_frame(frame, reference_faces, similarity_threshold, app):
-    detected_faces = adaptive_face_detection(frame, app, 30)
+def match_faces_in_frame(frame, reference_faces, similarity_threshold, app, content_type):
+    detected_faces = adaptive_face_detection(frame, app, 30, content_type)
     
     matched_faces = []
     
@@ -550,6 +598,7 @@ CHARACTER APPEARANCES IN TEST FRAMES:
 def process_single_video(video_path, output_root, args):
     try:
         video_name = Path(video_path).stem
+        content_type = detect_content_type(video_path)
         
         existing_dirs = [d for d in os.listdir(output_root) if d.startswith(video_name + "_")]
         archive_dir = os.path.join(output_root, "archive_facemap")
@@ -568,6 +617,7 @@ def process_single_video(video_path, output_root, args):
         
         logger = setup_logging(output_dir)
         logger.info(f"Processing video: {video_path}")
+        logger.info(f"Content type: {content_type}")
         logger.info(f"Output directory: {output_dir}")
         
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
@@ -581,7 +631,7 @@ def process_single_video(video_path, output_root, args):
         logger.info("Model loaded successfully")
         
         embeddings, frame_indices, face_boxes = extract_faces_from_video(
-            video_path, args['sample_rate'], args['min_face_size'], app, logger
+            video_path, args['sample_rate'], args['min_face_size'], app, logger, content_type
         )
         
         if len(embeddings) == 0:
@@ -604,7 +654,7 @@ def process_single_video(video_path, output_root, args):
         frame_matches = []
         
         for frame_idx, frame_path, frame in tqdm(test_frames, desc="Processing test frames", leave=False):
-            matches = match_faces_in_frame(frame, reference_faces, args['similarity_threshold'], app)
+            matches = match_faces_in_frame(frame, reference_faces, args['similarity_threshold'], app, content_type)
             
             frame_matches.append({
                 'frame_idx': int(frame_idx),
@@ -657,7 +707,7 @@ def process_videos_batch(video_files, output_root, args):
     print(f"GPUs: 2 (0.0625 GPU per task)")
     print(f"Concurrent pipelines: 32")
     print(f"Quality weight: {args.quality_weight}")
-    print(f"Anime detection: Adaptive (auto-enabled when no real faces found)")
+    print(f"Intelligent content detection: Enabled (anime/cartoon/live-action)")
     
     ray.init(num_gpus=2, num_cpus=32)
     
@@ -729,6 +779,8 @@ def main():
                         help='Maximum number of folders to process')
     parser.add_argument('--quality-weight', type=float, default=0.6,
                         help='Weight for image quality in reference selection (0-1)')
+    parser.add_argument('--retry-failed', action='store_true',
+                        help='Retry only previously failed videos (0-2 characters or no output)')
     
     args = parser.parse_args()
     
@@ -739,13 +791,15 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     print("Scanning for video files...")
-    video_files = get_video_files(args.videos_dir, args.max_folders)
+    video_files = get_video_files(args.videos_dir, args.max_folders, args.retry_failed, args.output_dir)
     
     if len(video_files) == 0:
         print(f"No video files found in {args.videos_dir}")
         sys.exit(1)
     
-    if args.max_folders:
+    if args.retry_failed:
+        print(f"Retrying {len(video_files)} failed videos")
+    elif args.max_folders:
         print(f"Processing first {args.max_folders} folders for testing")
     
     print(f"Found {len(video_files)} video files")
