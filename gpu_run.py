@@ -1,7 +1,8 @@
 import argparse
 import cv2
 import numpy as np
-from insightface.app import FaceAnalysis
+import torch
+import torch.nn.functional as F
 from sklearn.cluster import DBSCAN
 from sklearn.metrics.pairwise import cosine_similarity
 import matplotlib
@@ -22,6 +23,7 @@ import traceback
 import ray
 import time
 import shutil
+from facenet_pytorch import MTCNN, InceptionResnetV1
 
 warnings.filterwarnings('ignore')
 
@@ -62,11 +64,11 @@ def calculate_multi_scale_quality(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
     h, w = gray.shape
     
-    if h < 32 or w < 32:
+    if h < 50 or w < 50:
         return 0.0
     
     lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-    sharpness = min(lap_var / 500.0, 1.0)
+    sharpness = min(lap_var / 1000.0, 1.0)
     
     sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
     sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
@@ -84,8 +86,10 @@ def calculate_multi_scale_quality(image):
     contrast = gray.std()
     contrast_score = min(contrast / 64.0, 1.0)
     
-    quality_score = (sharpness * 0.35 + edge_score * 0.25 + brightness_score * 0.15 + 
-                     entropy_score * 0.15 + contrast_score * 0.10)
+    size_score = min((h * w) / 10000.0, 1.0)
+    
+    quality_score = (sharpness * 0.30 + edge_score * 0.20 + brightness_score * 0.15 + 
+                     entropy_score * 0.10 + contrast_score * 0.10 + size_score * 0.15)
     
     return quality_score
 
@@ -163,7 +167,7 @@ def enhance_image(image):
     return enhanced
 
 
-def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger):
+def extract_faces_from_video(video_path, sample_rate, min_face_size, mtcnn, resnet, device, logger):
     logger.info(f"Opening video: {video_path}")
     cap = cv2.VideoCapture(video_path)
     
@@ -192,32 +196,43 @@ def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger
             break
         
         if frame_idx % sample_rate == 0:
-            faces = app.get(frame)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            for face in faces:
-                bbox = face.bbox.astype(int)
-                x1, y1, x2, y2 = bbox
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(width, x2), min(height, y2)
-                
-                if (x2 - x1) >= min_face_size and (y2 - y1) >= min_face_size:
-                    face_crop = frame[y1:y2, x1:x2]
+            boxes, probs = mtcnn.detect(frame_rgb)
+            
+            if boxes is not None:
+                for box, prob in zip(boxes, probs):
+                    x1, y1, x2, y2 = box.astype(int)
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(width, x2), min(height, y2)
                     
-                    if face_crop.size == 0:
-                        continue
-                    
-                    quality_score = calculate_multi_scale_quality(face_crop)
-                    aesthetic_score = calculate_aesthetic_score(face_crop)
-                    
-                    all_faces.append(face.embedding)
-                    frame_indices.append(frame_idx)
-                    face_boxes.append({
-                        'frame_idx': int(frame_idx),
-                        'bbox': [int(x1), int(y1), int(x2), int(y2)],
-                        'confidence': float(face.det_score),
-                        'quality_score': float(quality_score),
-                        'aesthetic_score': float(aesthetic_score)
-                    })
+                    if (x2 - x1) >= min_face_size and (y2 - y1) >= min_face_size and prob > 0.9:
+                        face_crop = frame[y1:y2, x1:x2]
+                        
+                        if face_crop.size == 0:
+                            continue
+                        
+                        face_rgb_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+                        face_tensor = torch.from_numpy(face_rgb_crop).permute(2, 0, 1).float()
+                        face_tensor = F.interpolate(face_tensor.unsqueeze(0), size=(160, 160), mode='bilinear', align_corners=False)
+                        face_tensor = (face_tensor - 127.5) / 128.0
+                        face_tensor = face_tensor.to(device)
+                        
+                        with torch.no_grad():
+                            embedding = resnet(face_tensor).cpu().numpy()[0]
+                        
+                        quality_score = calculate_multi_scale_quality(face_crop)
+                        aesthetic_score = calculate_aesthetic_score(face_crop)
+                        
+                        all_faces.append(embedding)
+                        frame_indices.append(frame_idx)
+                        face_boxes.append({
+                            'frame_idx': int(frame_idx),
+                            'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                            'confidence': float(prob),
+                            'quality_score': float(quality_score),
+                            'aesthetic_score': float(aesthetic_score)
+                        })
             
             pbar.update(1)
         
@@ -268,7 +283,7 @@ def cluster_faces(embeddings, face_boxes, logger, total_frames, eps=0.32, min_sa
     return filtered_labels
 
 
-def select_best_reference_faces(embeddings, labels, face_boxes, video_path, num_candidates=10):
+def select_best_reference_faces(embeddings, labels, face_boxes, video_path, num_candidates=15):
     reference_faces = {}
     
     unique_labels = set(labels)
@@ -309,7 +324,7 @@ def select_best_reference_faces(embeddings, labels, face_boxes, video_path, num_
             
             x1, y1, x2, y2 = bbox
             
-            padding = 0.3
+            padding = 0.5
             w, h = x2 - x1, y2 - y1
             pad_w, pad_h = int(w * padding), int(h * padding)
             
@@ -438,32 +453,51 @@ def generate_test_frames_from_video(video_path, num_frames, output_dir, logger):
     return saved_frames
 
 
-def match_faces_in_frame(frame, reference_faces, similarity_threshold, app):
-    faces = app.get(frame)
+def match_faces_in_frame(frame, reference_faces, similarity_threshold, mtcnn, resnet, device):
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    
+    boxes, probs = mtcnn.detect(frame_rgb)
     
     matched_faces = []
     
-    for face in faces:
-        bbox = face.bbox.astype(int)
-        embedding = face.embedding
-        
-        best_match = None
-        best_similarity = -1
-        
-        for char_id, ref_data in reference_faces.items():
-            ref_embedding = ref_data['embedding']
-            similarity = cosine_similarity([embedding], [ref_embedding])[0][0]
+    if boxes is not None:
+        for box, prob in zip(boxes, probs):
+            bbox = box.astype(int)
+            x1, y1, x2, y2 = bbox
             
-            if similarity > best_similarity and similarity > similarity_threshold:
-                best_similarity = similarity
-                best_match = char_id
-        
-        matched_faces.append({
-            'bbox': bbox.tolist(),
-            'character_id': best_match,
-            'confidence': float(face.det_score),
-            'similarity': float(best_similarity) if best_match else 0.0
-        })
+            if prob < 0.9:
+                continue
+            
+            face_crop = frame[y1:y2, x1:x2]
+            if face_crop.size == 0:
+                continue
+            
+            face_rgb_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+            face_tensor = torch.from_numpy(face_rgb_crop).permute(2, 0, 1).float()
+            face_tensor = F.interpolate(face_tensor.unsqueeze(0), size=(160, 160), mode='bilinear', align_corners=False)
+            face_tensor = (face_tensor - 127.5) / 128.0
+            face_tensor = face_tensor.to(device)
+            
+            with torch.no_grad():
+                embedding = resnet(face_tensor).cpu().numpy()[0]
+            
+            best_match = None
+            best_similarity = -1
+            
+            for char_id, ref_data in reference_faces.items():
+                ref_embedding = ref_data['embedding']
+                similarity = cosine_similarity([embedding], [ref_embedding])[0][0]
+                
+                if similarity > best_similarity and similarity > similarity_threshold:
+                    best_similarity = similarity
+                    best_match = char_id
+            
+            matched_faces.append({
+                'bbox': bbox.tolist(),
+                'character_id': best_match,
+                'confidence': float(prob),
+                'similarity': float(best_similarity) if best_match else 0.0
+            })
     
     return matched_faces
 
@@ -566,9 +600,23 @@ CHARACTER APPEARANCES IN TEST FRAMES:
     return report
 
 
-@ray.remote(num_gpus=0.125, num_cpus=1)
+@ray.remote(num_gpus=0.25, num_cpus=1)
 def process_single_video(video_path, output_root, args):
     try:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        mtcnn = MTCNN(
+            image_size=160,
+            margin=0,
+            min_face_size=50,
+            thresholds=[0.6, 0.7, 0.7],
+            factor=0.709,
+            post_process=False,
+            device=device
+        )
+        
+        resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+        
         video_name = Path(video_path).stem
         
         existing_dirs = [d for d in os.listdir(output_root) if d.startswith(video_name + "_")]
@@ -590,19 +638,10 @@ def process_single_video(video_path, output_root, args):
         logger = setup_logging(output_dir)
         logger.info(f"Processing video: {video_path}")
         logger.info(f"Output directory: {output_dir}")
-        
-        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-        
-        app = FaceAnalysis(
-            name='buffalo_sc',
-            providers=providers
-        )
-        app.prepare(ctx_id=0, det_size=(640, 640))
-        
-        logger.info("Model loaded: buffalo_sc")
+        logger.info("Model: MTCNN + InceptionResnetV1 (VGGFace2)")
         
         embeddings, frame_indices, face_boxes = extract_faces_from_video(
-            video_path, args['sample_rate'], args['min_face_size'], app, logger
+            video_path, args['sample_rate'], args['min_face_size'], mtcnn, resnet, device, logger
         )
         
         if len(embeddings) == 0:
@@ -631,7 +670,7 @@ def process_single_video(video_path, output_root, args):
         frame_matches = []
         
         for frame_idx, frame_path, frame in tqdm(test_frames, desc="Processing test frames", leave=False):
-            matches = match_faces_in_frame(frame, reference_faces, args['similarity_threshold'], app)
+            matches = match_faces_in_frame(frame, reference_faces, args['similarity_threshold'], mtcnn, resnet, device)
             
             frame_matches.append({
                 'frame_idx': int(frame_idx),
@@ -681,14 +720,14 @@ def process_videos_batch(video_files, output_root, args):
     
     print(f"\nStarting batch processing")
     print(f"Total videos: {total_videos}")
-    print(f"Model: buffalo_sc")
+    print(f"Model: MTCNN + InceptionResnetV1 (VGGFace2 - SOTA)")
     print(f"GPUs: 2")
-    print(f"GPU per task: 0.125")
-    print(f"Max concurrent tasks: 16")
+    print(f"GPU per task: 0.25")
+    print(f"Max concurrent tasks: 8")
     print(f"Candidate frames per character: {args.num_candidates}")
     print(f"Test frames per video: {args.num_test_frames}")
     
-    ray.init(num_gpus=2, num_cpus=16)
+    ray.init(num_gpus=2, num_cpus=8)
     
     args_dict = {
         'num_test_frames': args.num_test_frames,
@@ -740,7 +779,7 @@ def process_videos_batch(video_files, output_root, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Optimized Face Recognition Pipeline for Movies')
+    parser = argparse.ArgumentParser(description='SOTA Face Recognition Pipeline using FaceNet')
     
     parser.add_argument('--videos-dir', type=str, default='/mnt/data/data_hub/movies_dataset/videos',
                         help='Directory containing video files')
@@ -750,7 +789,7 @@ def main():
                         help='Number of test frames to generate per video')
     parser.add_argument('--sample-rate', type=int, default=30,
                         help='Frame sampling rate for face extraction')
-    parser.add_argument('--min-face-size', type=int, default=30,
+    parser.add_argument('--min-face-size', type=int, default=50,
                         help='Minimum face size in pixels')
     parser.add_argument('--similarity-threshold', type=float, default=0.35,
                         help='Similarity threshold for face matching')
