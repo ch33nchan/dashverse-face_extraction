@@ -20,6 +20,8 @@ import logging
 import sys
 import traceback
 import ray
+import time
+import shutil
 
 warnings.filterwarnings('ignore')
 
@@ -41,7 +43,7 @@ def get_video_files(videos_dir, max_folders=None):
     video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv']
     video_files = []
     
-    subdirs = [d for d in os.listdir(videos_dir) if os.path.isdir(os.path.join(videos_dir, d))]
+    subdirs = sorted([d for d in os.listdir(videos_dir) if os.path.isdir(os.path.join(videos_dir, d))])
     
     if max_folders:
         subdirs = subdirs[:max_folders]
@@ -54,6 +56,118 @@ def get_video_files(videos_dir, max_folders=None):
                     video_files.append(os.path.join(root, file))
     
     return video_files
+
+
+def calculate_multi_scale_quality(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    h, w = gray.shape
+    
+    if h < 32 or w < 32:
+        return 0.0
+    
+    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    sharpness = min(lap_var / 500.0, 1.0)
+    
+    sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    edge_strength = np.sqrt(sobelx**2 + sobely**2).mean()
+    edge_score = min(edge_strength / 50.0, 1.0)
+    
+    brightness = gray.mean()
+    brightness_score = 1.0 - abs(brightness - 127.5) / 127.5
+    
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+    hist_norm = hist.ravel() / hist.sum()
+    entropy = -np.sum(hist_norm * np.log2(hist_norm + 1e-7))
+    entropy_score = min(entropy / 8.0, 1.0)
+    
+    contrast = gray.std()
+    contrast_score = min(contrast / 64.0, 1.0)
+    
+    quality_score = (sharpness * 0.35 + edge_score * 0.25 + brightness_score * 0.15 + 
+                     entropy_score * 0.15 + contrast_score * 0.10)
+    
+    return quality_score
+
+
+def detect_anime_faces(frame):
+    try:
+        from anime_face_detector import create_detector
+        if not hasattr(detect_anime_faces, 'detector'):
+            detect_anime_faces.detector = create_detector('yolov3')
+        
+        preds = detect_anime_faces.detector(frame)
+        
+        anime_faces = []
+        for pred in preds:
+            bbox = pred['bbox']
+            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+            
+            face_region = frame[y1:y2, x1:x2]
+            if face_region.size == 0:
+                continue
+            
+            face_region_gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
+            
+            sift = cv2.SIFT_create(nfeatures=128)
+            keypoints, descriptors = sift.detectAndCompute(face_region_gray, None)
+            
+            if descriptors is not None and len(descriptors) > 0:
+                feature = descriptors.mean(axis=0)
+                feature = feature / (np.linalg.norm(feature) + 1e-8)
+            else:
+                face_resized = cv2.resize(face_region, (112, 112))
+                feature = face_resized.flatten()
+                feature = feature / (np.linalg.norm(feature) + 1e-8)
+            
+            anime_faces.append({
+                'bbox': [x1, y1, x2, y2],
+                'embedding': feature,
+                'confidence': pred.get('score', 0.5)
+            })
+        
+        return anime_faces
+    except Exception as e:
+        return []
+
+
+def adaptive_face_detection(frame, app, min_face_size):
+    width, height = frame.shape[1], frame.shape[0]
+    
+    faces_real = app.get(frame)
+    
+    valid_faces_real = []
+    for face in faces_real:
+        bbox = face.bbox.astype(int)
+        x1, y1, x2, y2 = bbox
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(width, x2), min(height, y2)
+        
+        if (x2 - x1) >= min_face_size and (y2 - y1) >= min_face_size:
+            valid_faces_real.append({
+                'bbox': [x1, y1, x2, y2],
+                'embedding': face.embedding,
+                'confidence': float(face.det_score),
+                'face_type': 'real'
+            })
+    
+    if len(valid_faces_real) > 0:
+        return valid_faces_real
+    
+    anime_faces = detect_anime_faces(frame)
+    
+    valid_faces_anime = []
+    for face in anime_faces:
+        x1, y1, x2, y2 = face['bbox']
+        if (x2 - x1) >= min_face_size and (y2 - y1) >= min_face_size:
+            valid_faces_anime.append({
+                'bbox': face['bbox'],
+                'embedding': face['embedding'],
+                'confidence': face['confidence'],
+                'face_type': 'anime'
+            })
+    
+    return valid_faces_anime
 
 
 def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger):
@@ -77,7 +191,7 @@ def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger
     frame_idx = 0
     frames_to_process = total_frames // sample_rate
     
-    pbar = tqdm(total=frames_to_process, desc="Extracting faces", unit="frame")
+    pbar = tqdm(total=frames_to_process, desc="Extracting faces", leave=False)
     
     while True:
         ret, frame = cap.read()
@@ -85,30 +199,28 @@ def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger
             break
         
         if frame_idx % sample_rate == 0:
-            faces = app.get(frame)
+            detected_faces = adaptive_face_detection(frame, app, min_face_size)
             
-            for face in faces:
-                bbox = face.bbox.astype(int)
-                x1, y1, x2, y2 = bbox
+            for face in detected_faces:
+                x1, y1, x2, y2 = face['bbox']
+                face_crop = frame[y1:y2, x1:x2]
                 
-                x1 = max(0, x1)
-                y1 = max(0, y1)
-                x2 = min(width, x2)
-                y2 = min(height, y2)
-                
-                if (x2 - x1) < min_face_size or (y2 - y1) < min_face_size:
+                if face_crop.size == 0:
                     continue
                 
-                all_faces.append(face.embedding)
+                quality_score = calculate_multi_scale_quality(face_crop)
+                
+                all_faces.append(face['embedding'])
                 frame_indices.append(frame_idx)
                 face_boxes.append({
                     'frame_idx': int(frame_idx),
                     'bbox': [int(x1), int(y1), int(x2), int(y2)],
-                    'confidence': float(face.det_score)
+                    'confidence': float(face['confidence']),
+                    'quality_score': float(quality_score),
+                    'face_type': face['face_type']
                 })
             
             pbar.update(1)
-            pbar.set_postfix({'faces': len(all_faces)})
         
         frame_idx += 1
     
@@ -120,25 +232,43 @@ def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger
     return np.array(all_faces), frame_indices, face_boxes
 
 
-def cluster_faces(embeddings, eps, min_samples, logger):
-    logger.info(f"Clustering {len(embeddings)} faces...")
+def hierarchical_clustering(embeddings, face_boxes, eps_range=[0.3, 0.4, 0.5], min_samples=3):
+    best_labels = None
+    best_n_clusters = 0
+    best_eps = eps_range[0]
     
     similarity_matrix = cosine_similarity(embeddings)
     distance_matrix = 1 - similarity_matrix
     distance_matrix = np.clip(distance_matrix, 0, None)
     
-    clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='precomputed')
-    labels = clustering.fit_predict(distance_matrix)
+    for eps in eps_range:
+        clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='precomputed')
+        labels = clustering.fit_predict(distance_matrix)
+        
+        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+        
+        if n_clusters > best_n_clusters:
+            best_n_clusters = n_clusters
+            best_labels = labels
+            best_eps = eps
+    
+    return best_labels, best_eps
+
+
+def cluster_faces(embeddings, face_boxes, logger):
+    logger.info(f"Clustering {len(embeddings)} faces with adaptive parameters...")
+    
+    labels, best_eps = hierarchical_clustering(embeddings, face_boxes)
     
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise = list(labels).count(-1)
     
-    logger.info(f"Clustering complete - Characters: {n_clusters}, Noise: {n_noise}")
+    logger.info(f"Clustering complete - Characters: {n_clusters}, Noise: {n_noise}, Best eps: {best_eps}")
     
     return labels
 
 
-def select_best_reference_faces(embeddings, labels, face_boxes):
+def select_best_reference_faces(embeddings, labels, face_boxes, quality_weight=0.6):
     reference_faces = {}
     
     unique_labels = set(labels)
@@ -149,14 +279,20 @@ def select_best_reference_faces(embeddings, labels, face_boxes):
         cluster_indices = np.where(labels == label)[0]
         cluster_boxes = [face_boxes[i] for i in cluster_indices]
         
-        confidences = [box['confidence'] for box in cluster_boxes]
-        best_idx = cluster_indices[np.argmax(confidences)]
+        scores = []
+        for box in cluster_boxes:
+            combined_score = (box['confidence'] * (1 - quality_weight)) + (box['quality_score'] * quality_weight)
+            scores.append(combined_score)
+        
+        best_idx = cluster_indices[np.argmax(scores)]
         
         reference_faces[f"character_{label}"] = {
             'embedding': embeddings[best_idx],
             'frame_idx': face_boxes[best_idx]['frame_idx'],
             'bbox': face_boxes[best_idx]['bbox'],
             'confidence': face_boxes[best_idx]['confidence'],
+            'quality_score': face_boxes[best_idx]['quality_score'],
+            'face_type': face_boxes[best_idx]['face_type'],
             'cluster_size': len(cluster_indices)
         }
     
@@ -171,7 +307,7 @@ def extract_reference_images(video_path, reference_faces, output_dir, logger):
     
     logger.info("Extracting reference face images...")
     
-    for char_id, data in tqdm(reference_faces.items(), desc="Extracting references"):
+    for char_id, data in tqdm(reference_faces.items(), desc="Extracting references", leave=False):
         cap.set(cv2.CAP_PROP_POS_FRAMES, data['frame_idx'])
         ret, frame = cap.read()
         
@@ -194,7 +330,7 @@ def extract_reference_images(video_path, reference_faces, output_dir, logger):
             face_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
             
             ref_path = f"{output_dir}/{char_id}_reference.jpg"
-            Image.fromarray(face_crop).save(ref_path)
+            Image.fromarray(face_crop).save(ref_path, quality=95)
             ref_images[char_id] = face_crop
     
     cap.release()
@@ -214,7 +350,7 @@ def generate_test_frames_from_video(video_path, num_frames, output_dir, logger):
     logger.info(f"Generating {num_frames} test frames...")
     saved_frames = []
     
-    for idx in tqdm(test_indices, desc="Generating test frames"):
+    for idx in tqdm(test_indices, desc="Generating test frames", leave=False):
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
         if ret:
@@ -228,21 +364,22 @@ def generate_test_frames_from_video(video_path, num_frames, output_dir, logger):
 
 
 def match_faces_in_frame(frame, reference_faces, similarity_threshold, app):
-    faces = app.get(frame)
-    
-    if len(faces) == 0:
-        return []
+    detected_faces = adaptive_face_detection(frame, app, 30)
     
     matched_faces = []
     
-    for face in faces:
-        bbox = face.bbox.astype(int)
-        embedding = face.embedding
+    for face in detected_faces:
+        bbox = face['bbox']
+        embedding = face['embedding']
+        face_type = face['face_type']
         
         best_match = None
         best_similarity = -1
         
         for char_id, ref_data in reference_faces.items():
+            if ref_data.get('face_type') != face_type:
+                continue
+            
             ref_embedding = ref_data['embedding']
             similarity = cosine_similarity([embedding], [ref_embedding])[0][0]
             
@@ -251,9 +388,9 @@ def match_faces_in_frame(frame, reference_faces, similarity_threshold, app):
                 best_match = char_id
         
         matched_faces.append({
-            'bbox': bbox.tolist(),
+            'bbox': bbox,
             'character_id': best_match,
-            'confidence': float(face.det_score),
+            'confidence': float(face['confidence']),
             'similarity': float(best_similarity) if best_match else 0.0
         })
     
@@ -344,9 +481,7 @@ def generate_summary_report(frame_matches, reference_faces):
             char_appearances[char] += 1
     
     report = f"""
-{'='*70}
 FACE MATCHING SUMMARY REPORT
-{'='*70}
 
 VIDEO ANALYSIS:
 - Total test frames processed: {total_frames}
@@ -365,15 +500,20 @@ CHARACTER APPEARANCES IN TEST FRAMES:
         percentage = count / total_frames * 100
         report += f"- {char_id}: {count} frames ({percentage:.1f}%)\n"
     
-    report += f"\n{'='*70}\n"
-    
     return report
 
 
-@ray.remote(num_gpus=0.25)
+@ray.remote(num_gpus=0.0625)
 def process_single_video(video_path, output_root, args):
     try:
         video_name = Path(video_path).stem
+        
+        existing_dirs = [d for d in os.listdir(output_root) if d.startswith(video_name + "_")]
+        if existing_dirs:
+            output_dir = os.path.join(output_root, existing_dirs[0])
+            if os.path.exists(output_dir):
+                shutil.rmtree(output_dir)
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = os.path.join(output_root, f"{video_name}_{timestamp}")
         os.makedirs(output_dir, exist_ok=True)
@@ -400,9 +540,9 @@ def process_single_video(video_path, output_root, args):
             logger.warning("No faces found in video")
             return False
         
-        labels = cluster_faces(embeddings, args['dbscan_eps'], args['min_cluster_size'], logger)
+        labels = cluster_faces(embeddings, face_boxes, logger)
         
-        reference_faces = select_best_reference_faces(embeddings, labels, face_boxes)
+        reference_faces = select_best_reference_faces(embeddings, labels, face_boxes, args['quality_weight'])
         logger.info(f"Selected {len(reference_faces)} reference faces")
         
         reference_images = extract_reference_images(video_path, reference_faces, output_dir, logger)
@@ -415,7 +555,7 @@ def process_single_video(video_path, output_root, args):
         logger.info("Matching faces and creating visualizations...")
         frame_matches = []
         
-        for frame_idx, frame_path, frame in tqdm(test_frames, desc="Processing test frames"):
+        for frame_idx, frame_path, frame in tqdm(test_frames, desc="Processing test frames", leave=False):
             matches = match_faces_in_frame(frame, reference_faces, args['similarity_threshold'], app)
             
             frame_matches.append({
@@ -464,54 +604,66 @@ def process_single_video(video_path, output_root, args):
 def process_videos_batch(video_files, output_root, args):
     total_videos = len(video_files)
     
-    print(f"\n{'='*70}")
-    print(f"STARTING BATCH PROCESSING WITH RAY")
-    print(f"{'='*70}")
-    print(f"Total videos found: {total_videos}")
-    print(f"Using 2 GPUs with fractional allocation (0.25 GPU per task)")
-    print(f"Concurrent pipelines: 8")
-    print(f"Processing all videos in directory recursively")
-    print(f"{'='*70}\n")
+    print(f"\nStarting batch processing with Ray")
+    print(f"Total videos: {total_videos}")
+    print(f"GPUs: 2 (0.125 GPU per task)")
+    print(f"Concurrent pipelines: 16")
+    print(f"Quality weight: {args.quality_weight}")
+    print(f"Anime detection: Adaptive (auto-enabled when no real faces found)")
     
-    ray.init(num_gpus=2)
+    ray.init(num_gpus=2, num_cpus=16)
     
     args_dict = {
         'num_test_frames': args.num_test_frames,
         'sample_rate': args.sample_rate,
         'min_face_size': args.min_face_size,
         'similarity_threshold': args.similarity_threshold,
-        'dbscan_eps': args.dbscan_eps,
-        'min_cluster_size': args.min_cluster_size
+        'quality_weight': args.quality_weight
     }
     
     futures = [process_single_video.remote(video_path, output_root, args_dict) for video_path in video_files]
     
     results = []
-    with tqdm(total=total_videos, desc="Overall Progress") as pbar:
+    start_time = time.time()
+    
+    with tqdm(total=total_videos, desc="Overall progress", unit="video") as pbar:
         while len(futures) > 0:
             done, futures = ray.wait(futures, timeout=1.0)
             for future in done:
                 results.append(ray.get(future))
                 pbar.update(1)
+                
+                completed = len(results)
+                elapsed = time.time() - start_time
+                if completed > 0:
+                    avg_time_per_video = elapsed / completed
+                    remaining = total_videos - completed
+                    eta_seconds = avg_time_per_video * remaining
+                    eta_hours = int(eta_seconds // 3600)
+                    eta_minutes = int((eta_seconds % 3600) // 60)
+                    pbar.set_postfix({
+                        'Success': sum(results),
+                        'Failed': completed - sum(results),
+                        'ETA': f'{eta_hours}h {eta_minutes}m'
+                    })
     
     ray.shutdown()
     
     successful = sum(results)
     failed = len(results) - successful
+    total_time = time.time() - start_time
     
-    print(f"\n{'='*70}")
-    print(f"BATCH PROCESSING COMPLETE")
-    print(f"{'='*70}")
+    print(f"\nBatch processing complete")
     print(f"Total videos processed: {total_videos}")
     print(f"Successful: {successful}")
     print(f"Failed: {failed}")
     print(f"Success rate: {(successful/total_videos)*100:.1f}%")
+    print(f"Total time: {int(total_time//3600)}h {int((total_time%3600)//60)}m")
     print(f"Output directory: {output_root}")
-    print(f"{'='*70}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Batch Face Mapping for Multiple Videos with Ray')
+    parser = argparse.ArgumentParser(description='Adaptive Multi-Modal Face Recognition Pipeline')
     
     parser.add_argument('--videos-dir', type=str, default='/mnt/data/data_hub/movies_dataset/videos',
                         help='Directory containing video files')
@@ -525,12 +677,10 @@ def main():
                         help='Minimum face size in pixels')
     parser.add_argument('--similarity-threshold', type=float, default=0.35,
                         help='Similarity threshold for face matching')
-    parser.add_argument('--dbscan-eps', type=float, default=0.4,
-                        help='DBSCAN epsilon parameter')
-    parser.add_argument('--min-cluster-size', type=int, default=3,
-                        help='Minimum cluster size for DBSCAN')
     parser.add_argument('--max-folders', type=int, default=None,
-                        help='Maximum number of folders to process (1, 2, 3, or all)')
+                        help='Maximum number of folders to process')
+    parser.add_argument('--quality-weight', type=float, default=0.6,
+                        help='Weight for image quality in reference selection (0-1)')
     
     args = parser.parse_args()
     
@@ -540,7 +690,7 @@ def main():
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    print("Scanning for video files recursively...")
+    print("Scanning for video files...")
     video_files = get_video_files(args.videos_dir, args.max_folders)
     
     if len(video_files) == 0:
@@ -548,13 +698,10 @@ def main():
         sys.exit(1)
     
     if args.max_folders:
-        print(f"\nProcessing first {args.max_folders} folder(s) for testing")
+        print(f"Processing first {args.max_folders} folders for testing")
     
-    print(f"\nFound {len(video_files)} video files across subdirectories:")
-    for idx, video in enumerate(video_files, 1):
-        print(f"  {idx}. {video}")
+    print(f"Found {len(video_files)} video files")
     
-    print(f"\nProcessing all {len(video_files)} videos with Ray (2 GPUs, 8 concurrent pipelines)...")
     process_videos_batch(video_files, args.output_dir, args)
 
 
