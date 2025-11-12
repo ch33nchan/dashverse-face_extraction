@@ -552,12 +552,12 @@ def process_single_video(video_path, output_root, args):
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
         
         app = FaceAnalysis(
-            name='antelopev2',
+            name='buffalo_l',
             providers=providers
         )
         app.prepare(ctx_id=0, det_size=(640, 640))
         
-        logger.info("Model loaded: antelopev2")
+        logger.info("Model loaded: buffalo_l")
         
         embeddings, frame_indices, face_boxes = extract_faces_from_video(
             video_path, args['sample_rate'], args['min_face_size'], app, logger
@@ -635,7 +635,7 @@ def process_videos_batch(video_files, output_root, args):
     
     print(f"\nStarting batch processing")
     print(f"Total videos: {total_videos}")
-    print(f"Model: antelopev2")
+    print(f"Model: buffalo_l")
     print(f"GPUs: 2")
     print(f"Concurrent tasks: 32")
     print(f"Candidate frames per character: {args.num_candidates}")
