@@ -131,7 +131,50 @@ def detect_anime_faces(frame):
         return []
 
 
-def adaptive_face_detection(frame, app, min_face_size):
+def detect_content_type(video_path):
+    filename = os.path.basename(video_path).lower()
+    
+    anime_keywords = [
+        'anime', 'dragon ball', 'naruto', 'one piece', 'pokemon', 'digimon',
+        'evangelion', 'akira', 'ghibli', 'miyazaki', 'spirited away', 'totoro',
+        'cowboy bebop', 'ghost in the shell', 'sailor moon', 'bleach',
+        'attack on titan', 'demon slayer', 'jujutsu kaisen', 'fate stay',
+        'sword art', 'gundam', 'macross', 'lupin', 'detective conan',
+        'studio ghibli', 'arrietty', 'ponyo', 'howl', 'mononoke', 'kiki'
+    ]
+    
+    cartoon_keywords = [
+        'charlie brown', 'snoopy', 'peanuts', 'tom and jerry', 'bugs bunny',
+        'looney', 'scooby', 'garfield', 'simpsons', 'family guy', 'futurama',
+        'south park', 'spongebob', 'adventure time', 'regular show',
+        'gravity falls', 'steven universe', 'avatar', 'teen titans',
+        'lego', 'mickey mouse', 'disney', 'pixar', 'dreamworks',
+        'minions', 'despicable', 'shrek', 'kung fu panda', 'madagascar',
+        'ice age', 'rio', 'trolls', 'boss baby', 'croods',
+        'puss in boots', 'barbie', 'my little pony', 'care bears'
+    ]
+    
+    animation_keywords = [
+        'animated', 'animation', 'cartoon', 'claymation', 'stop motion',
+        'cgi', 'computer generated', '3d animated', '2d animated'
+    ]
+    
+    for keyword in anime_keywords:
+        if keyword in filename:
+            return 'anime'
+    
+    for keyword in cartoon_keywords:
+        if keyword in filename:
+            return 'cartoon'
+    
+    for keyword in animation_keywords:
+        if keyword in filename:
+            return 'animation'
+    
+    return 'live_action'
+
+
+def adaptive_face_detection(frame, app, min_face_size, content_type='live_action'):
     width, height = frame.shape[1], frame.shape[0]
     
     faces_real = app.get(frame)
@@ -509,10 +552,15 @@ def process_single_video(video_path, output_root, args):
         video_name = Path(video_path).stem
         
         existing_dirs = [d for d in os.listdir(output_root) if d.startswith(video_name + "_")]
+        archive_dir = os.path.join(output_root, "archive_facemap")
+        
         if existing_dirs:
-            output_dir = os.path.join(output_root, existing_dirs[0])
-            if os.path.exists(output_dir):
-                shutil.rmtree(output_dir)
+            os.makedirs(archive_dir, exist_ok=True)
+            for old_dir in existing_dirs:
+                old_path = os.path.join(output_root, old_dir)
+                archive_path = os.path.join(archive_dir, old_dir)
+                if os.path.exists(old_path):
+                    shutil.move(old_path, archive_path)
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = os.path.join(output_root, f"{video_name}_{timestamp}")
@@ -606,12 +654,12 @@ def process_videos_batch(video_files, output_root, args):
     
     print(f"\nStarting batch processing with Ray")
     print(f"Total videos: {total_videos}")
-    print(f"GPUs: 2 (0.125 GPU per task)")
-    print(f"Concurrent pipelines: 16")
+    print(f"GPUs: 2 (0.0625 GPU per task)")
+    print(f"Concurrent pipelines: 32")
     print(f"Quality weight: {args.quality_weight}")
     print(f"Anime detection: Adaptive (auto-enabled when no real faces found)")
     
-    ray.init(num_gpus=2, num_cpus=16)
+    ray.init(num_gpus=2, num_cpus=32)
     
     args_dict = {
         'num_test_frames': args.num_test_frames,
