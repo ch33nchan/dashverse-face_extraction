@@ -231,7 +231,7 @@ def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger
     return np.array(all_faces), frame_indices, face_boxes
 
 
-def cluster_faces(embeddings, face_boxes, logger, eps=0.4, min_samples=3):
+def cluster_faces(embeddings, face_boxes, logger, eps=0.35, min_samples=5):
     logger.info(f"Clustering {len(embeddings)} faces")
     
     similarity_matrix = cosine_similarity(embeddings)
@@ -358,7 +358,7 @@ def extract_reference_images(video_path, reference_faces, output_dir, logger):
                 continue
             
             enhanced = enhance_image(face_crop)
-            enhanced_resized = cv2.resize(enhanced, (224, 224), interpolation=cv2.INTER_LANCZOS4)
+            enhanced_resized = cv2.resize(enhanced, (512, 512), interpolation=cv2.INTER_LANCZOS4)
             
             face_rgb = cv2.cvtColor(enhanced_resized, cv2.COLOR_BGR2RGB)
             
@@ -552,12 +552,12 @@ def process_single_video(video_path, output_root, args):
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
         
         app = FaceAnalysis(
-            name='buffalo_l',
+            name='buffalo_sc',
             providers=providers
         )
         app.prepare(ctx_id=0, det_size=(640, 640))
         
-        logger.info("Model loaded: buffalo_l")
+        logger.info("Model loaded: buffalo_sc")
         
         embeddings, frame_indices, face_boxes = extract_faces_from_video(
             video_path, args['sample_rate'], args['min_face_size'], app, logger
@@ -635,7 +635,7 @@ def process_videos_batch(video_files, output_root, args):
     
     print(f"\nStarting batch processing")
     print(f"Total videos: {total_videos}")
-    print(f"Model: buffalo_l")
+    print(f"Model: buffalo_sc")
     print(f"GPUs: 2")
     print(f"Concurrent tasks: 32")
     print(f"Candidate frames per character: {args.num_candidates}")
