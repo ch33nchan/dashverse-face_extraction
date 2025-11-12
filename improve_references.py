@@ -141,18 +141,14 @@ def extract_improved_reference_images(video_path, reference_faces, output_dir, n
     
     reference_images = {}
     
-    # Group faces by character
     character_frames = {}
-    for face_id, face_data in reference_faces.items():
-        char_id = face_data['character_id']
-        if char_id not in character_frames:
-            character_frames[char_id] = []
-        character_frames[char_id].append({
-            'face_id': face_id,
+    for char_id, face_data in reference_faces.items():
+        character_frames[char_id] = [{
+            'face_id': char_id,
             'frame_idx': face_data['frame_idx'],
             'bbox': face_data['bbox'],
-            'quality': face_data.get('quality', 0.5)
-        })
+            'quality': face_data.get('confidence', 0.5)
+        }]
     
     print(f"Found {len(character_frames)} unique characters")
     
