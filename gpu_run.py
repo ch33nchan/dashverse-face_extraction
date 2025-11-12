@@ -7,7 +7,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 import pickle
 import os
 import json
@@ -39,54 +39,9 @@ def setup_logging(output_dir):
     return logging.getLogger(__name__)
 
 
-def get_video_files(videos_dir, max_folders=None, retry_failed=False, output_dir=None):
+def get_video_files(videos_dir, max_folders=None):
     video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv']
     video_files = []
-    
-    if retry_failed and output_dir:
-        failed_videos = []
-        
-        for result_dir in os.listdir(output_dir):
-            if result_dir == 'archive_facemap':
-                continue
-            
-            result_path = os.path.join(output_dir, result_dir)
-            if not os.path.isdir(result_path):
-                continue
-            
-            summary_file = os.path.join(result_path, 'summary_report.txt')
-            
-            is_failed = False
-            if not os.path.exists(summary_file):
-                is_failed = True
-            else:
-                with open(summary_file, 'r') as f:
-                    content = f.read()
-                    for line in content.split('\n'):
-                        if 'Total unique characters:' in line:
-                            num_chars = int(line.split(':')[1].strip())
-                            if num_chars <= 2:
-                                is_failed = True
-                            break
-            
-            if is_failed:
-                video_name = '_'.join(result_dir.split('_')[:-2])
-                failed_videos.append(video_name)
-        
-        print(f"Found {len(failed_videos)} failed videos to retry")
-        
-        for root, dirs, files in os.walk(videos_dir):
-            for file in files:
-                if any(file.lower().endswith(ext) for ext in video_extensions):
-                    filepath = os.path.join(root, file)
-                    filename = Path(filepath).stem
-                    
-                    for failed_name in failed_videos:
-                        if failed_name in filename:
-                            video_files.append(filepath)
-                            break
-        
-        return video_files
     
     subdirs = sorted([d for d in os.listdir(videos_dir) if os.path.isdir(os.path.join(videos_dir, d))])
     
@@ -135,134 +90,81 @@ def calculate_multi_scale_quality(image):
     return quality_score
 
 
-def detect_anime_faces(frame):
-    try:
-        from anime_face_detector import create_detector
-        if not hasattr(detect_anime_faces, 'detector'):
-            detect_anime_faces.detector = create_detector('yolov3')
-        
-        preds = detect_anime_faces.detector(frame)
-        
-        anime_faces = []
-        for pred in preds:
-            bbox = pred['bbox']
-            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-            
-            face_region = frame[y1:y2, x1:x2]
-            if face_region.size == 0:
-                continue
-            
-            face_region_gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
-            
-            sift = cv2.SIFT_create(nfeatures=128)
-            keypoints, descriptors = sift.detectAndCompute(face_region_gray, None)
-            
-            if descriptors is not None and len(descriptors) > 0:
-                feature = descriptors.mean(axis=0)
-                feature = feature / (np.linalg.norm(feature) + 1e-8)
-            else:
-                face_resized = cv2.resize(face_region, (112, 112))
-                feature = face_resized.flatten()
-                feature = feature / (np.linalg.norm(feature) + 1e-8)
-            
-            anime_faces.append({
-                'bbox': [x1, y1, x2, y2],
-                'embedding': feature,
-                'confidence': pred.get('score', 0.5)
-            })
-        
-        return anime_faces
-    except Exception as e:
-        return []
+def calculate_aesthetic_score(image):
+    if len(image.shape) == 2:
+        gray = image
+        color = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    else:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        color = image
+    
+    h, w = gray.shape
+    
+    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    sharpness_score = min(lap_var / 1000.0, 1.0)
+    
+    brightness = gray.mean()
+    brightness_score = 1.0 - abs(brightness - 130) / 130.0
+    brightness_score = max(0, brightness_score)
+    
+    contrast = gray.std()
+    contrast_score = min(contrast / 70.0, 1.0)
+    
+    if len(image.shape) == 3:
+        hsv = cv2.cvtColor(color, cv2.COLOR_BGR2HSV)
+        saturation = hsv[:, :, 1].mean()
+        vibrancy_score = min(saturation / 128.0, 1.0)
+    else:
+        vibrancy_score = 0.5
+    
+    overexposed = np.sum(gray > 240) / gray.size
+    underexposed = np.sum(gray < 20) / gray.size
+    exposure_score = 1.0 - (overexposed + underexposed)
+    
+    edges = cv2.Canny(gray, 100, 200)
+    edge_density = np.sum(edges > 0) / edges.size
+    edge_score = min(edge_density / 0.15, 1.0)
+    
+    aesthetic_score = (
+        sharpness_score * 0.25 +
+        brightness_score * 0.20 +
+        contrast_score * 0.15 +
+        vibrancy_score * 0.15 +
+        exposure_score * 0.15 +
+        edge_score * 0.10
+    )
+    
+    return aesthetic_score
 
 
-def detect_content_type(video_path):
-    filename = os.path.basename(video_path).lower()
+def enhance_image(image):
+    if len(image.shape) == 2:
+        pil_image = Image.fromarray(image)
+    else:
+        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(rgb_image)
     
-    anime_keywords = [
-        'anime', 'dragon ball', 'naruto', 'one piece', 'pokemon', 'digimon',
-        'evangelion', 'akira', 'ghibli', 'miyazaki', 'spirited away', 'totoro',
-        'cowboy bebop', 'ghost in the shell', 'sailor moon', 'bleach',
-        'attack on titan', 'demon slayer', 'jujutsu kaisen', 'fate stay',
-        'sword art', 'gundam', 'macross', 'lupin', 'detective conan',
-        'studio ghibli', 'arrietty', 'ponyo', 'howl', 'mononoke', 'kiki'
-    ]
+    pil_image = pil_image.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
     
-    cartoon_keywords = [
-        'charlie brown', 'snoopy', 'peanuts', 'tom and jerry', 'bugs bunny',
-        'looney', 'scooby', 'garfield', 'simpsons', 'family guy', 'futurama',
-        'south park', 'spongebob', 'adventure time', 'regular show',
-        'gravity falls', 'steven universe', 'avatar', 'teen titans',
-        'lego', 'mickey mouse', 'disney', 'pixar', 'dreamworks',
-        'minions', 'despicable', 'shrek', 'kung fu panda', 'madagascar',
-        'ice age', 'rio', 'trolls', 'boss baby', 'croods',
-        'puss in boots', 'barbie', 'my little pony', 'care bears'
-    ]
+    enhancer = ImageEnhance.Contrast(pil_image)
+    pil_image = enhancer.enhance(1.15)
     
-    animation_keywords = [
-        'animated', 'animation', 'cartoon', 'claymation', 'stop motion',
-        'cgi', 'computer generated', '3d animated', '2d animated'
-    ]
+    enhancer = ImageEnhance.Color(pil_image)
+    pil_image = enhancer.enhance(1.1)
     
-    for keyword in anime_keywords:
-        if keyword in filename:
-            return 'anime'
+    enhancer = ImageEnhance.Brightness(pil_image)
+    pil_image = enhancer.enhance(1.05)
     
-    for keyword in cartoon_keywords:
-        if keyword in filename:
-            return 'cartoon'
+    enhanced = np.array(pil_image)
     
-    for keyword in animation_keywords:
-        if keyword in filename:
-            return 'animation'
+    if len(image.shape) == 3:
+        enhanced = cv2.cvtColor(enhanced, cv2.COLOR_RGB2BGR)
     
-    return 'live_action'
+    return enhanced
 
 
-def adaptive_face_detection(frame, app, min_face_size, content_type='live_action'):
-    width, height = frame.shape[1], frame.shape[0]
-    
-    if content_type in ['anime', 'cartoon', 'animation']:
-        anime_faces = detect_anime_faces(frame)
-        
-        if len(anime_faces) > 0:
-            valid_faces = []
-            for face in anime_faces:
-                x1, y1, x2, y2 = face['bbox']
-                if (x2 - x1) >= min_face_size and (y2 - y1) >= min_face_size:
-                    valid_faces.append({
-                        'bbox': face['bbox'],
-                        'embedding': face['embedding'],
-                        'confidence': face['confidence'],
-                        'face_type': 'anime'
-                    })
-            
-            if len(valid_faces) > 0:
-                return valid_faces
-    
-    faces_real = app.get(frame)
-    
-    valid_faces_real = []
-    for face in faces_real:
-        bbox = face.bbox.astype(int)
-        x1, y1, x2, y2 = bbox
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(width, x2), min(height, y2)
-        
-        if (x2 - x1) >= min_face_size and (y2 - y1) >= min_face_size:
-            valid_faces_real.append({
-                'bbox': [x1, y1, x2, y2],
-                'embedding': face.embedding,
-                'confidence': float(face.det_score),
-                'face_type': 'real'
-            })
-    
-    return valid_faces_real
-
-
-def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger, content_type):
+def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger):
     logger.info(f"Opening video: {video_path}")
-    logger.info(f"Content type detected: {content_type}")
     cap = cv2.VideoCapture(video_path)
     
     if not cap.isOpened():
@@ -273,7 +175,7 @@ def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    logger.info(f"Video info - Frames: {total_frames}, FPS: {fps:.2f}, Resolution: {width}x{height}")
+    logger.info(f"Video properties: {total_frames} frames, {fps:.2f} FPS, {width}x{height}")
     
     all_faces = []
     frame_indices = []
@@ -282,7 +184,7 @@ def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger
     frame_idx = 0
     frames_to_process = total_frames // sample_rate
     
-    pbar = tqdm(total=frames_to_process, desc="Extracting faces", leave=False)
+    pbar = tqdm(total=frames_to_process, desc="Extracting faces", unit="frame", leave=False)
     
     while True:
         ret, frame = cap.read()
@@ -290,26 +192,32 @@ def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger
             break
         
         if frame_idx % sample_rate == 0:
-            detected_faces = adaptive_face_detection(frame, app, min_face_size, content_type)
+            faces = app.get(frame)
             
-            for face in detected_faces:
-                x1, y1, x2, y2 = face['bbox']
-                face_crop = frame[y1:y2, x1:x2]
+            for face in faces:
+                bbox = face.bbox.astype(int)
+                x1, y1, x2, y2 = bbox
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(width, x2), min(height, y2)
                 
-                if face_crop.size == 0:
-                    continue
-                
-                quality_score = calculate_multi_scale_quality(face_crop)
-                
-                all_faces.append(face['embedding'])
-                frame_indices.append(frame_idx)
-                face_boxes.append({
-                    'frame_idx': int(frame_idx),
-                    'bbox': [int(x1), int(y1), int(x2), int(y2)],
-                    'confidence': float(face['confidence']),
-                    'quality_score': float(quality_score),
-                    'face_type': face['face_type']
-                })
+                if (x2 - x1) >= min_face_size and (y2 - y1) >= min_face_size:
+                    face_crop = frame[y1:y2, x1:x2]
+                    
+                    if face_crop.size == 0:
+                        continue
+                    
+                    quality_score = calculate_multi_scale_quality(face_crop)
+                    aesthetic_score = calculate_aesthetic_score(face_crop)
+                    
+                    all_faces.append(face.embedding)
+                    frame_indices.append(frame_idx)
+                    face_boxes.append({
+                        'frame_idx': int(frame_idx),
+                        'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                        'confidence': float(face.det_score),
+                        'quality_score': float(quality_score),
+                        'aesthetic_score': float(aesthetic_score)
+                    })
             
             pbar.update(1)
         
@@ -318,75 +226,106 @@ def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger
     cap.release()
     pbar.close()
     
-    logger.info(f"Extraction complete - Processed: {frame_idx} frames, Extracted: {len(all_faces)} faces")
+    logger.info(f"Extraction complete: {len(all_faces)} faces from {frame_idx} frames")
     
     return np.array(all_faces), frame_indices, face_boxes
 
 
-def hierarchical_clustering(embeddings, face_boxes, eps_range=[0.3, 0.4, 0.5], min_samples=3):
-    best_labels = None
-    best_n_clusters = 0
-    best_eps = eps_range[0]
+def cluster_faces(embeddings, face_boxes, logger, eps=0.4, min_samples=3):
+    logger.info(f"Clustering {len(embeddings)} faces")
     
     similarity_matrix = cosine_similarity(embeddings)
     distance_matrix = 1 - similarity_matrix
     distance_matrix = np.clip(distance_matrix, 0, None)
     
-    for eps in eps_range:
-        clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='precomputed')
-        labels = clustering.fit_predict(distance_matrix)
-        
-        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-        
-        if n_clusters > best_n_clusters:
-            best_n_clusters = n_clusters
-            best_labels = labels
-            best_eps = eps
-    
-    return best_labels, best_eps
-
-
-def cluster_faces(embeddings, face_boxes, logger):
-    logger.info(f"Clustering {len(embeddings)} faces with adaptive parameters...")
-    
-    labels, best_eps = hierarchical_clustering(embeddings, face_boxes)
+    clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='precomputed')
+    labels = clustering.fit_predict(distance_matrix)
     
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise = list(labels).count(-1)
     
-    logger.info(f"Clustering complete - Characters: {n_clusters}, Noise: {n_noise}, Best eps: {best_eps}")
+    logger.info(f"Clustering complete: {n_clusters} characters, {n_noise} noise points")
     
     return labels
 
 
-def select_best_reference_faces(embeddings, labels, face_boxes, quality_weight=0.6):
+def select_best_reference_faces(embeddings, labels, face_boxes, video_path, num_candidates=10):
     reference_faces = {}
     
     unique_labels = set(labels)
     if -1 in unique_labels:
         unique_labels.remove(-1)
     
-    for label in unique_labels:
+    cap = cv2.VideoCapture(video_path)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    for label in tqdm(unique_labels, desc="Selecting references", leave=False):
         cluster_indices = np.where(labels == label)[0]
         cluster_boxes = [face_boxes[i] for i in cluster_indices]
         
-        scores = []
+        quality_scores = []
         for box in cluster_boxes:
-            combined_score = (box['confidence'] * (1 - quality_weight)) + (box['quality_score'] * quality_weight)
-            scores.append(combined_score)
+            base_score = (box['confidence'] * 0.3 + 
+                         box['quality_score'] * 0.3 + 
+                         box['aesthetic_score'] * 0.4)
+            quality_scores.append(base_score)
         
-        best_idx = cluster_indices[np.argmax(scores)]
+        top_candidates_idx = np.argsort(quality_scores)[-num_candidates:]
+        top_candidates = [cluster_boxes[i] for i in top_candidates_idx]
         
-        reference_faces[f"character_{label}"] = {
-            'embedding': embeddings[best_idx],
-            'frame_idx': face_boxes[best_idx]['frame_idx'],
-            'bbox': face_boxes[best_idx]['bbox'],
-            'confidence': face_boxes[best_idx]['confidence'],
-            'quality_score': face_boxes[best_idx]['quality_score'],
-            'face_type': face_boxes[best_idx]['face_type'],
-            'cluster_size': len(cluster_indices)
-        }
+        best_frame = None
+        best_aesthetic = -1
+        best_box = None
+        
+        for candidate in top_candidates:
+            frame_idx = candidate['frame_idx']
+            bbox = candidate['bbox']
+            
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            
+            if not ret or frame is None:
+                continue
+            
+            x1, y1, x2, y2 = bbox
+            
+            padding = 0.3
+            w, h = x2 - x1, y2 - y1
+            pad_w, pad_h = int(w * padding), int(h * padding)
+            
+            x1 = max(0, x1 - pad_w)
+            y1 = max(0, y1 - pad_h)
+            x2 = min(width, x2 + pad_w)
+            y2 = min(height, y2 + pad_h)
+            
+            face_crop = frame[y1:y2, x1:x2]
+            
+            if face_crop.size == 0:
+                continue
+            
+            aesthetic_score = calculate_aesthetic_score(face_crop)
+            combined_score = aesthetic_score * 0.7 + candidate['quality_score'] * 0.3
+            
+            if combined_score > best_aesthetic:
+                best_aesthetic = combined_score
+                best_frame = frame_idx
+                best_box = bbox
+        
+        if best_box is not None:
+            best_idx = cluster_indices[np.argmax(quality_scores)]
+            
+            reference_faces[f"character_{label}"] = {
+                'embedding': embeddings[best_idx],
+                'frame_idx': best_frame,
+                'bbox': best_box,
+                'confidence': face_boxes[best_idx]['confidence'],
+                'quality_score': face_boxes[best_idx]['quality_score'],
+                'aesthetic_score': best_aesthetic,
+                'cluster_size': len(cluster_indices)
+            }
     
+    cap.release()
     return reference_faces
 
 
@@ -396,7 +335,7 @@ def extract_reference_images(video_path, reference_faces, output_dir, logger):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     ref_images = {}
     
-    logger.info("Extracting reference face images...")
+    logger.info("Extracting and enhancing reference images")
     
     for char_id, data in tqdm(reference_faces.items(), desc="Extracting references", leave=False):
         cap.set(cv2.CAP_PROP_POS_FRAMES, data['frame_idx'])
@@ -417,15 +356,18 @@ def extract_reference_images(video_path, reference_faces, output_dir, logger):
             
             if face_crop.size == 0:
                 continue
-                
-            face_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+            
+            enhanced = enhance_image(face_crop)
+            enhanced_resized = cv2.resize(enhanced, (224, 224), interpolation=cv2.INTER_LANCZOS4)
+            
+            face_rgb = cv2.cvtColor(enhanced_resized, cv2.COLOR_BGR2RGB)
             
             ref_path = f"{output_dir}/{char_id}_reference.jpg"
-            Image.fromarray(face_crop).save(ref_path, quality=95)
-            ref_images[char_id] = face_crop
+            Image.fromarray(face_rgb).save(ref_path, quality=95)
+            ref_images[char_id] = face_rgb
     
     cap.release()
-    logger.info(f"Extracted {len(ref_images)} reference images")
+    logger.info(f"Extracted {len(ref_images)} enhanced reference images")
     return ref_images
 
 
@@ -438,7 +380,7 @@ def generate_test_frames_from_video(video_path, num_frames, output_dir, logger):
     test_frames_dir = f"{output_dir}/test_frames"
     os.makedirs(test_frames_dir, exist_ok=True)
     
-    logger.info(f"Generating {num_frames} test frames...")
+    logger.info(f"Generating {num_frames} test frames")
     saved_frames = []
     
     for idx in tqdm(test_indices, desc="Generating test frames", leave=False):
@@ -454,23 +396,19 @@ def generate_test_frames_from_video(video_path, num_frames, output_dir, logger):
     return saved_frames
 
 
-def match_faces_in_frame(frame, reference_faces, similarity_threshold, app, content_type):
-    detected_faces = adaptive_face_detection(frame, app, 30, content_type)
+def match_faces_in_frame(frame, reference_faces, similarity_threshold, app):
+    faces = app.get(frame)
     
     matched_faces = []
     
-    for face in detected_faces:
-        bbox = face['bbox']
-        embedding = face['embedding']
-        face_type = face['face_type']
+    for face in faces:
+        bbox = face.bbox.astype(int)
+        embedding = face.embedding
         
         best_match = None
         best_similarity = -1
         
         for char_id, ref_data in reference_faces.items():
-            if ref_data.get('face_type') != face_type:
-                continue
-            
             ref_embedding = ref_data['embedding']
             similarity = cosine_similarity([embedding], [ref_embedding])[0][0]
             
@@ -479,9 +417,9 @@ def match_faces_in_frame(frame, reference_faces, similarity_threshold, app, cont
                 best_match = char_id
         
         matched_faces.append({
-            'bbox': bbox,
+            'bbox': bbox.tolist(),
             'character_id': best_match,
-            'confidence': float(face['confidence']),
+            'confidence': float(face.det_score),
             'similarity': float(best_similarity) if best_match else 0.0
         })
     
@@ -491,63 +429,55 @@ def match_faces_in_frame(frame, reference_faces, similarity_threshold, app, cont
 def create_visualization(frame, matches, reference_images, frame_idx):
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     
-    frame_annotated = frame_rgb.copy()
-    pil_frame = Image.fromarray(frame_annotated)
-    draw = ImageDraw.Draw(pil_frame)
+    detected_chars = [m['character_id'] for m in matches if m['character_id']]
     
-    detected_chars = []
-    
-    for match in matches:
-        x1, y1, x2, y2 = match['bbox']
-        char_id = match['character_id']
+    if len(detected_chars) == 0:
+        fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+        ax.imshow(frame_rgb)
         
-        if char_id:
-            draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=3)
-            detected_chars.append(char_id)
-    
-    frame_annotated = np.array(pil_frame)
-    
-    if len(matches) == 0:
-        fig, ax = plt.subplots(1, 1, figsize=(12, 8))
-        ax.imshow(frame_annotated)
-        ax.set_title(f"Frame {frame_idx}: NO FACES FOUND", fontsize=16, color='red', weight='bold')
-        ax.axis('off')
-        ax.text(0.5, 0.5, 'NO FACES FOUND', 
-                transform=ax.transAxes, fontsize=30, color='red',
-                ha='center', va='center', weight='bold',
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-        return fig
-    
-    num_detected = len(detected_chars)
-    
-    if num_detected == 0:
-        fig, ax = plt.subplots(1, 1, figsize=(12, 8))
-        ax.imshow(frame_annotated)
-        ax.set_title(f"Frame {frame_idx}: Faces detected but not matched", 
-                     fontsize=14, weight='bold')
+        for match in matches:
+            bbox = match['bbox']
+            rect = plt.Rectangle(
+                (bbox[0], bbox[1]),
+                bbox[2] - bbox[0],
+                bbox[3] - bbox[1],
+                fill=False,
+                edgecolor='red',
+                linewidth=2
+            )
+            ax.add_patch(rect)
+        
+        ax.set_title(f'Frame {frame_idx}', fontsize=12)
         ax.axis('off')
         return fig
     
-    cols = num_detected + 1
-    fig_width = 4 * cols
-    fig, axes = plt.subplots(1, cols, figsize=(fig_width, 6))
+    cols = len(detected_chars) + 1
+    fig, axes = plt.subplots(1, cols, figsize=(4 * cols, 5))
     
     if cols == 2:
         axes = [axes[0], axes[1]]
     
-    axes[0].imshow(frame_annotated)
-    axes[0].set_title("Input Frame", fontsize=14, weight='bold')
-    axes[0].text(0.5, -0.05, 'im', transform=axes[0].transAxes, 
-                 fontsize=10, ha='center')
+    axes[0].imshow(frame_rgb)
+    axes[0].set_title('Input Frame', fontsize=12)
     axes[0].axis('off')
+    
+    for match in matches:
+        if match['character_id']:
+            bbox = match['bbox']
+            rect = plt.Rectangle(
+                (bbox[0], bbox[1]),
+                bbox[2] - bbox[0],
+                bbox[3] - bbox[1],
+                fill=False,
+                edgecolor='lime',
+                linewidth=2
+            )
+            axes[0].add_patch(rect)
     
     for idx, char_id in enumerate(detected_chars, 1):
         if char_id in reference_images:
             axes[idx].imshow(reference_images[char_id])
-            axes[idx].set_title(char_id.replace('character_', 'Character '), 
-                                fontsize=12, weight='bold')
-            axes[idx].text(0.5, -0.05, 'ref', transform=axes[idx].transAxes,
-                           fontsize=10, ha='center')
+            axes[idx].set_title(char_id.replace('character_', 'Character '), fontsize=12)
             axes[idx].axis('off')
     
     plt.tight_layout()
@@ -598,9 +528,9 @@ CHARACTER APPEARANCES IN TEST FRAMES:
 def process_single_video(video_path, output_root, args):
     try:
         video_name = Path(video_path).stem
-        content_type = detect_content_type(video_path)
         
         existing_dirs = [d for d in os.listdir(output_root) if d.startswith(video_name + "_")]
+        
         archive_dir = os.path.join(output_root, "archive_facemap")
         
         if existing_dirs:
@@ -617,21 +547,20 @@ def process_single_video(video_path, output_root, args):
         
         logger = setup_logging(output_dir)
         logger.info(f"Processing video: {video_path}")
-        logger.info(f"Content type: {content_type}")
         logger.info(f"Output directory: {output_dir}")
         
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
         
         app = FaceAnalysis(
-            name='buffalo_l',
+            name='antelopev2',
             providers=providers
         )
         app.prepare(ctx_id=0, det_size=(640, 640))
         
-        logger.info("Model loaded successfully")
+        logger.info("Model loaded: antelopev2")
         
         embeddings, frame_indices, face_boxes = extract_faces_from_video(
-            video_path, args['sample_rate'], args['min_face_size'], app, logger, content_type
+            video_path, args['sample_rate'], args['min_face_size'], app, logger
         )
         
         if len(embeddings) == 0:
@@ -640,7 +569,9 @@ def process_single_video(video_path, output_root, args):
         
         labels = cluster_faces(embeddings, face_boxes, logger)
         
-        reference_faces = select_best_reference_faces(embeddings, labels, face_boxes, args['quality_weight'])
+        reference_faces = select_best_reference_faces(
+            embeddings, labels, face_boxes, video_path, num_candidates=args['num_candidates']
+        )
         logger.info(f"Selected {len(reference_faces)} reference faces")
         
         reference_images = extract_reference_images(video_path, reference_faces, output_dir, logger)
@@ -650,11 +581,11 @@ def process_single_video(video_path, output_root, args):
         viz_dir = f"{output_dir}/visualizations"
         os.makedirs(viz_dir, exist_ok=True)
         
-        logger.info("Matching faces and creating visualizations...")
+        logger.info("Matching faces and creating visualizations")
         frame_matches = []
         
         for frame_idx, frame_path, frame in tqdm(test_frames, desc="Processing test frames", leave=False):
-            matches = match_faces_in_frame(frame, reference_faces, args['similarity_threshold'], app, content_type)
+            matches = match_faces_in_frame(frame, reference_faces, args['similarity_threshold'], app)
             
             frame_matches.append({
                 'frame_idx': int(frame_idx),
@@ -702,12 +633,13 @@ def process_single_video(video_path, output_root, args):
 def process_videos_batch(video_files, output_root, args):
     total_videos = len(video_files)
     
-    print(f"\nStarting batch processing with Ray")
+    print(f"\nStarting batch processing")
     print(f"Total videos: {total_videos}")
-    print(f"GPUs: 2 (0.0625 GPU per task)")
-    print(f"Concurrent pipelines: 32")
-    print(f"Quality weight: {args.quality_weight}")
-    print(f"Intelligent content detection: Enabled (anime/cartoon/live-action)")
+    print(f"Model: antelopev2")
+    print(f"GPUs: 2")
+    print(f"Concurrent tasks: 32")
+    print(f"Candidate frames per character: {args.num_candidates}")
+    print(f"Test frames per video: {args.num_test_frames}")
     
     ray.init(num_gpus=2, num_cpus=32)
     
@@ -716,7 +648,7 @@ def process_videos_batch(video_files, output_root, args):
         'sample_rate': args.sample_rate,
         'min_face_size': args.min_face_size,
         'similarity_threshold': args.similarity_threshold,
-        'quality_weight': args.quality_weight
+        'num_candidates': args.num_candidates
     }
     
     futures = [process_single_video.remote(video_path, output_root, args_dict) for video_path in video_files]
@@ -761,7 +693,7 @@ def process_videos_batch(video_files, output_root, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Adaptive Multi-Modal Face Recognition Pipeline')
+    parser = argparse.ArgumentParser(description='Optimized Face Recognition Pipeline for Movies')
     
     parser.add_argument('--videos-dir', type=str, default='/mnt/data/data_hub/movies_dataset/videos',
                         help='Directory containing video files')
@@ -777,10 +709,8 @@ def main():
                         help='Similarity threshold for face matching')
     parser.add_argument('--max-folders', type=int, default=None,
                         help='Maximum number of folders to process')
-    parser.add_argument('--quality-weight', type=float, default=0.6,
-                        help='Weight for image quality in reference selection (0-1)')
-    parser.add_argument('--retry-failed', action='store_true',
-                        help='Retry only previously failed videos (0-2 characters or no output)')
+    parser.add_argument('--num-candidates', type=int, default=15,
+                        help='Number of candidate frames to evaluate per character')
     
     args = parser.parse_args()
     
@@ -790,17 +720,15 @@ def main():
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    print("Scanning for video files...")
-    video_files = get_video_files(args.videos_dir, args.max_folders, args.retry_failed, args.output_dir)
+    print("Scanning for video files")
+    video_files = get_video_files(args.videos_dir, args.max_folders)
     
     if len(video_files) == 0:
         print(f"No video files found in {args.videos_dir}")
         sys.exit(1)
     
-    if args.retry_failed:
-        print(f"Retrying {len(video_files)} failed videos")
-    elif args.max_folders:
-        print(f"Processing first {args.max_folders} folders for testing")
+    if args.max_folders:
+        print(f"Processing first {args.max_folders} folders")
     
     print(f"Found {len(video_files)} video files")
     
