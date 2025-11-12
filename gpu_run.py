@@ -231,7 +231,7 @@ def extract_faces_from_video(video_path, sample_rate, min_face_size, app, logger
     return np.array(all_faces), frame_indices, face_boxes
 
 
-def cluster_faces(embeddings, face_boxes, logger, eps=0.35, min_samples=5):
+def cluster_faces(embeddings, face_boxes, logger, total_frames, eps=0.32, min_samples=5):
     logger.info(f"Clustering {len(embeddings)} faces")
     
     similarity_matrix = cosine_similarity(embeddings)
@@ -244,9 +244,28 @@ def cluster_faces(embeddings, face_boxes, logger, eps=0.35, min_samples=5):
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise = list(labels).count(-1)
     
-    logger.info(f"Clustering complete: {n_clusters} characters, {n_noise} noise points")
+    cluster_sizes = {}
+    for label in labels:
+        if label != -1:
+            cluster_sizes[label] = cluster_sizes.get(label, 0) + 1
     
-    return labels
+    movie_duration_minutes = total_frames / (24 * 60)
+    
+    if movie_duration_minutes < 60:
+        min_appearances = 5
+    elif movie_duration_minutes < 90:
+        min_appearances = 8
+    else:
+        min_appearances = 10
+    
+    main_characters = [label for label, size in cluster_sizes.items() if size >= min_appearances]
+    
+    filtered_labels = np.array([-1 if (label not in main_characters) else label for label in labels])
+    n_filtered = len(set(filtered_labels)) - (1 if -1 in filtered_labels else 0)
+    
+    logger.info(f"Clustering: {n_clusters} initial clusters, {n_filtered} characters (min {min_appearances} appearances)")
+    
+    return filtered_labels
 
 
 def select_best_reference_faces(embeddings, labels, face_boxes, video_path, num_candidates=10):
@@ -344,10 +363,16 @@ def extract_reference_images(video_path, reference_faces, output_dir, logger):
         if ret:
             x1, y1, x2, y2 = data['bbox']
             
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(width, x2)
-            y2 = min(height, y2)
+            face_width = x2 - x1
+            face_height = y2 - y1
+            
+            padding_h = int(face_height * 0.5)
+            padding_w = int(face_width * 0.5)
+            
+            x1 = max(0, x1 - padding_w)
+            y1 = max(0, y1 - padding_h)
+            x2 = min(width, x2 + padding_w)
+            y2 = min(height, y2 + padding_h)
             
             if x2 <= x1 or y2 <= y1:
                 continue
@@ -357,8 +382,25 @@ def extract_reference_images(video_path, reference_faces, output_dir, logger):
             if face_crop.size == 0:
                 continue
             
-            enhanced = enhance_image(face_crop)
-            enhanced_resized = cv2.resize(enhanced, (512, 512), interpolation=cv2.INTER_LANCZOS4)
+            crop_h, crop_w = face_crop.shape[:2]
+            
+            if crop_h < 200 or crop_w < 200:
+                target_size = 256
+            else:
+                target_size = min(512, max(crop_h, crop_w))
+            
+            if crop_h > target_size or crop_w > target_size:
+                enhanced = enhance_image(face_crop)
+                aspect_ratio = crop_w / crop_h
+                if aspect_ratio > 1:
+                    new_w = target_size
+                    new_h = int(target_size / aspect_ratio)
+                else:
+                    new_h = target_size
+                    new_w = int(target_size * aspect_ratio)
+                enhanced_resized = cv2.resize(enhanced, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+            else:
+                enhanced_resized = enhance_image(face_crop)
             
             face_rgb = cv2.cvtColor(enhanced_resized, cv2.COLOR_BGR2RGB)
             
@@ -524,7 +566,7 @@ CHARACTER APPEARANCES IN TEST FRAMES:
     return report
 
 
-@ray.remote(num_gpus=0.0625)
+@ray.remote(num_gpus=0.125, num_cpus=1)
 def process_single_video(video_path, output_root, args):
     try:
         video_name = Path(video_path).stem
@@ -567,7 +609,11 @@ def process_single_video(video_path, output_root, args):
             logger.warning("No faces found in video")
             return False
         
-        labels = cluster_faces(embeddings, face_boxes, logger)
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        
+        labels = cluster_faces(embeddings, face_boxes, logger, total_frames)
         
         reference_faces = select_best_reference_faces(
             embeddings, labels, face_boxes, video_path, num_candidates=args['num_candidates']
@@ -637,11 +683,12 @@ def process_videos_batch(video_files, output_root, args):
     print(f"Total videos: {total_videos}")
     print(f"Model: buffalo_sc")
     print(f"GPUs: 2")
-    print(f"Concurrent tasks: 32")
+    print(f"GPU per task: 0.125")
+    print(f"Max concurrent tasks: 16")
     print(f"Candidate frames per character: {args.num_candidates}")
     print(f"Test frames per video: {args.num_test_frames}")
     
-    ray.init(num_gpus=2, num_cpus=32)
+    ray.init(num_gpus=2, num_cpus=16)
     
     args_dict = {
         'num_test_frames': args.num_test_frames,
