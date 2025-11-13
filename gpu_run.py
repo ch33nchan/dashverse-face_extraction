@@ -299,16 +299,16 @@ def find_optimal_clustering_params(tracklet_embeddings, logger):
     
     flat_distances = distance_matrix[np.triu_indices_from(distance_matrix, k=1)]
     
-    # Try very aggressive eps values to force many clusters
-    eps_candidates = [0.35, 0.38, 0.40, 0.42, 0.45, 0.48, 0.50, 0.52, 0.55, 0.58, 0.60]
+    # Use TIGHTER clustering (lower eps = more clusters)
+    eps_candidates = [0.28, 0.30, 0.32, 0.35, 0.38, 0.40, 0.42, 0.45]
     
     logger.info(f"Testing {len(eps_candidates)} eps values...")
     
-    best_eps = 0.45  # Higher default for more clusters
+    best_eps = 0.32  # Tighter default
     best_score = -1
     best_n_clusters = 0
     
-    min_samples_base = 2  # Very low to allow small clusters
+    min_samples_base = 2
     
     for eps in eps_candidates:
         clustering = DBSCAN(eps=eps, min_samples=min_samples_base, metric='precomputed')
@@ -319,29 +319,27 @@ def find_optimal_clustering_params(tracklet_embeddings, logger):
         
         logger.info(f"  eps={eps:.2f}: {n_clusters} clusters, {n_noise} noise points")
         
-        # Want 10-50 clusters for a typical movie
-        if n_clusters >= 10 and n_clusters <= 60:
+        # Want 15-60 clusters
+        if n_clusters >= 15 and n_clusters <= 70:
             try:
                 score = silhouette_score(distance_matrix, labels, metric='precomputed')
                 logger.info(f"    silhouette={score:.3f}")
                 
-                # Prioritize more clusters
+                # Prefer more clusters
                 if n_clusters > best_n_clusters or (n_clusters == best_n_clusters and score > best_score):
                     best_score = score
                     best_eps = eps
                     best_n_clusters = n_clusters
             except Exception as e:
                 logger.info(f"    silhouette failed: {e}")
-        elif n_clusters > 10:
-            # Even if too many clusters, consider it
+        elif n_clusters > 15:
             best_eps = eps
             best_n_clusters = n_clusters
             break
     
-    # If still only 1-5 clusters, force very high eps
-    if best_n_clusters < 6:
-        logger.warning(f"Too few clusters ({best_n_clusters}), forcing eps=0.50")
-        best_eps = 0.50
+    if best_n_clusters < 10:
+        logger.warning(f"Too few clusters ({best_n_clusters}), forcing eps=0.32")
+        best_eps = 0.32
         clustering = DBSCAN(eps=best_eps, min_samples=min_samples_base, metric='precomputed')
         labels = clustering.fit_predict(distance_matrix)
         best_n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
@@ -349,6 +347,56 @@ def find_optimal_clustering_params(tracklet_embeddings, logger):
     logger.info(f"SELECTED: eps={best_eps:.3f}, expected {best_n_clusters} clusters, silhouette={best_score:.3f}")
     
     return best_eps, min_samples_base
+
+
+def refine_large_clusters(tracklet_embeddings, labels, logger):
+    """Split mega-clusters that are too large"""
+    
+    cluster_sizes = defaultdict(int)
+    for label in labels:
+        if label != -1:
+            cluster_sizes[label] += 1
+    
+    # Find clusters that are statistical outliers (way too large)
+    sizes = list(cluster_sizes.values())
+    if len(sizes) < 3:
+        return labels
+    
+    median_size = np.median(sizes)
+    
+    # If a cluster is 10x larger than median, it's probably multiple people
+    outlier_threshold = max(50, median_size * 10)
+    
+    new_labels = labels.copy()
+    next_label = max(labels) + 1
+    
+    for cluster_id, size in cluster_sizes.items():
+        if size > outlier_threshold:
+            logger.info(f"Splitting mega-cluster {cluster_id} ({size} tracklets, threshold={outlier_threshold:.0f})")
+            
+            # Get all tracklets in this cluster
+            cluster_indices = np.where(labels == cluster_id)[0]
+            cluster_embeddings = tracklet_embeddings[cluster_indices]
+            
+            # Re-cluster this mega-cluster with tighter eps
+            similarity_matrix = cosine_similarity(cluster_embeddings)
+            distance_matrix = 1 - similarity_matrix
+            distance_matrix = np.clip(distance_matrix, 0, None)
+            
+            # Use tight clustering
+            sub_clustering = DBSCAN(eps=0.25, min_samples=2, metric='precomputed')
+            sub_labels = sub_clustering.fit_predict(distance_matrix)
+            
+            # Reassign labels
+            for i, sub_label in enumerate(sub_labels):
+                if sub_label != -1:
+                    new_labels[cluster_indices[i]] = next_label + sub_label
+            
+            n_new_clusters = len(set(sub_labels)) - (1 if -1 in sub_labels else 0)
+            logger.info(f"  Split into {n_new_clusters} sub-clusters")
+            next_label += n_new_clusters
+    
+    return new_labels
 
 
 def cluster_tracklets_adaptive(tracklets, logger, total_frames):
@@ -372,6 +420,13 @@ def cluster_tracklets_adaptive(tracklets, logger, total_frames):
     labels = clustering.fit_predict(distance_matrix)
     
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    
+    # Refine: split mega-clusters
+    labels = refine_large_clusters(tracklet_embeddings, labels, logger)
+    n_clusters_refined = len(set(labels)) - (1 if -1 in labels else 0)
+    
+    if n_clusters_refined > n_clusters:
+        logger.info(f"Refinement: {n_clusters} → {n_clusters_refined} clusters after splitting mega-clusters")
     
     cluster_sizes = defaultdict(int)
     for label in labels:
