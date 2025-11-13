@@ -360,6 +360,55 @@ def farthest_point_sampling(embeddings, qualities, k=5):
     return selected_indices
 
 
+def has_text_overlay(face_crop):
+    gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+    
+    edges = cv2.Canny(gray, 100, 200)
+    
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=30, minLineLength=20, maxLineGap=5)
+    
+    if lines is not None and len(lines) > 5:
+        horizontal_lines = 0
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            if abs(y2 - y1) < 5:
+                horizontal_lines += 1
+        
+        if horizontal_lines > 3:
+            return True
+    
+    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+    white_pixels = np.sum(binary == 255) / binary.size
+    if white_pixels > 0.15:
+        return True
+    
+    return False
+
+
+def check_color_quality(face_crop):
+    hsv = cv2.cvtColor(face_crop, cv2.COLOR_BGR2HSV)
+    
+    v_channel = hsv[:, :, 2]
+    avg_brightness = v_channel.mean()
+    
+    if avg_brightness < 80:
+        return False, "too_dark"
+    
+    s_channel = hsv[:, :, 1]
+    avg_saturation = s_channel.mean()
+    
+    if avg_saturation > 180:
+        return False, "oversaturated"
+    
+    b, g, r = cv2.split(face_crop)
+    
+    color_balance = np.std([b.mean(), g.mean(), r.mean()])
+    if color_balance > 50:
+        return False, "color_cast"
+    
+    return True, "good"
+
+
 def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top_quality_percentile=90, k_prototypes=3):
     character_prototypes = {}
     
@@ -400,13 +449,20 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
             face_width = x2 - x1
             face_height = y2 - y1
             
-            padding_h = int(face_height * 0.3)
-            padding_w = int(face_width * 0.3)
+            if face_width < 100 or face_height < 100:
+                continue
+            
+            padding_h = int(face_height * 0.25)
+            padding_w = int(face_width * 0.25)
             
             x1 = max(0, x1 - padding_w)
             y1 = max(0, y1 - padding_h)
             x2 = min(width, x2 + padding_w)
             y2 = min(height, y2 + padding_h)
+            
+            margin = 30
+            if x1 < margin or y1 < margin or x2 > (width - margin) or y2 > (height - margin):
+                continue
             
             if x2 <= x1 or y2 <= y1:
                 continue
@@ -418,45 +474,60 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
             
             crop_h, crop_w = face_crop.shape[:2]
             
-            if crop_h < 80 or crop_w < 80:
+            if crop_h < 120 or crop_w < 120:
+                continue
+            
+            if has_text_overlay(face_crop):
+                continue
+            
+            color_ok, color_reason = check_color_quality(face_crop)
+            if not color_ok:
                 continue
             
             gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
             
             laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-            if laplacian_var < 200:
+            if laplacian_var < 300:
                 continue
             
             brightness = gray.mean()
-            if brightness < 60 or brightness > 200:
+            if brightness < 80 or brightness > 180:
                 continue
             
             contrast = gray.std()
-            if contrast < 30:
+            if contrast < 35:
                 continue
             
-            edges = cv2.Canny(gray, 50, 150)
-            edge_density = np.sum(edges > 0) / edges.size
+            sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+            sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+            edge_mag = np.sqrt(sobelx**2 + sobely**2)
+            edge_strength = edge_mag.mean()
             
-            hsv = cv2.cvtColor(face_crop, cv2.COLOR_BGR2HSV)
-            saturation = hsv[:, :, 1].mean()
+            if edge_strength < 20:
+                continue
             
             hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
             hist_norm = hist.ravel() / hist.sum()
             entropy = -np.sum(hist_norm * np.log2(hist_norm + 1e-7))
             
+            if entropy < 5.0:
+                continue
+            
+            hsv = cv2.cvtColor(face_crop, cv2.COLOR_BGR2HSV)
+            saturation = hsv[:, :, 1].mean()
+            
             embedding_dist = np.linalg.norm(det['embedding'] - cluster_centroid)
             embedding_score = 1.0 / (1.0 + embedding_dist)
             
             visual_quality = (
-                0.40 * min(laplacian_var / 1000.0, 1.0) +
-                0.20 * min(edge_density / 0.2, 1.0) +
+                0.35 * min(laplacian_var / 1000.0, 1.0) +
+                0.25 * min(edge_strength / 50.0, 1.0) +
                 0.15 * (1.0 - abs(brightness - 127.5) / 127.5) +
                 0.15 * min(contrast / 60.0, 1.0) +
-                0.10 * min(saturation / 100.0, 1.0)
+                0.10 * min(entropy / 8.0, 1.0)
             )
             
-            final_score = 0.7 * visual_quality + 0.3 * embedding_score
+            final_score = 0.65 * visual_quality + 0.35 * embedding_score
             
             candidate_faces.append({
                 'detection': det,
@@ -465,7 +536,8 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
                 'embedding_score': embedding_score,
                 'final_score': final_score,
                 'frame_idx': frame_idx,
-                'bbox': [x1, y1, x2, y2]
+                'bbox': [x1, y1, x2, y2],
+                'sharpness': laplacian_var
             })
         
         if not candidate_faces:
@@ -473,7 +545,7 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
         
         candidate_faces.sort(key=lambda x: x['final_score'], reverse=True)
         
-        top_candidates = candidate_faces[:min(k_prototypes * 3, len(candidate_faces))]
+        top_candidates = candidate_faces[:min(k_prototypes * 5, len(candidate_faces))]
         
         selected_prototypes = []
         selected_embeddings = []
@@ -492,7 +564,7 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
                 dist = np.linalg.norm(candidate['detection']['embedding'] - sel_emb)
                 min_dist = min(min_dist, dist)
             
-            if min_dist > 0.5:
+            if min_dist > 0.4:
                 selected_prototypes.append(candidate)
                 selected_embeddings.append(candidate['detection']['embedding'])
         
