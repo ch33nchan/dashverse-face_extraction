@@ -4,6 +4,7 @@ import numpy as np
 from insightface.app import FaceAnalysis
 from sklearn.cluster import DBSCAN
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import silhouette_score
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -59,49 +60,21 @@ def get_video_files(videos_dir, max_folders=None):
     return video_files
 
 
-def estimate_head_pose_simple(face_landmarks):
-    if face_landmarks is None or len(face_landmarks) < 5:
-        return 0.0
-    
-    left_eye = face_landmarks[0]
-    right_eye = face_landmarks[1]
-    nose = face_landmarks[2]
-    
-    eye_center_x = (left_eye[0] + right_eye[0]) / 2
-    
-    face_width = abs(right_eye[0] - left_eye[0])
-    if face_width < 1:
-        return 0.0
-    
-    nose_offset = (nose[0] - eye_center_x) / face_width
-    
-    yaw_angle = nose_offset * 90
-    
-    return abs(yaw_angle)
-
-
 def compute_quality_score(face_crop, bbox, frame_shape, det_conf, embedding_norm, landmarks=None):
     h, w = face_crop.shape[:2]
     frame_h, frame_w = frame_shape[:2]
     
     if h < 10 or w < 10:
-        return 0.0
+        return 0.0, {}
     
     gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY) if len(face_crop.shape) == 3 else face_crop
     
     laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-    sharpness = min(laplacian_var / 2000.0, 1.0)
-    
-    if laplacian_var < 100:
-        sharpness = 0.0
+    sharpness = min(laplacian_var / 1000.0, 1.0)
     
     bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
     frame_area = frame_h * frame_w
     relative_size = bbox_area / frame_area
-    
-    if relative_size < 0.01:
-        return 0.0
-    
     size_score = min(relative_size / 0.1, 1.0)
     
     x1, y1, x2, y2 = bbox
@@ -110,41 +83,55 @@ def compute_quality_score(face_crop, bbox, frame_shape, det_conf, embedding_norm
     if x1 < margin or y1 < margin or x2 > (frame_w - margin) or y2 > (frame_h - margin):
         border_penalty = 0.0
     
+    brightness = gray.mean()
+    brightness_score = 1.0 - abs(brightness - 127.5) / 127.5
+    
+    contrast = gray.std()
+    contrast_score = min(contrast / 60.0, 1.0)
+    
     embedding_score = min(embedding_norm / 20.0, 1.0)
     
     pose_penalty = 1.0
     if landmarks is not None:
-        yaw = estimate_head_pose_simple(landmarks)
-        if yaw > 30:
-            return 0.0
-        elif yaw > 20:
-            pose_penalty = 0.3
-        elif yaw > 10:
-            pose_penalty = 0.7
-    
-    brightness = gray.mean()
-    if brightness < 40 or brightness > 220:
-        return 0.0
-    
-    brightness_score = 1.0 - abs(brightness - 127.5) / 127.5
-    
-    contrast = gray.std()
-    if contrast < 20:
-        return 0.0
-    contrast_score = min(contrast / 60.0, 1.0)
+        if len(landmarks) >= 5:
+            left_eye = landmarks[0]
+            right_eye = landmarks[1]
+            nose = landmarks[2]
+            
+            eye_center_x = (left_eye[0] + right_eye[0]) / 2
+            face_width = abs(right_eye[0] - left_eye[0])
+            
+            if face_width > 1:
+                nose_offset = (nose[0] - eye_center_x) / face_width
+                yaw_angle = abs(nose_offset * 90)
+                
+                if yaw_angle > 30:
+                    pose_penalty = 0.0
+                elif yaw_angle > 20:
+                    pose_penalty = 0.3
+                elif yaw_angle > 10:
+                    pose_penalty = 0.7
     
     quality = (
-        0.35 * sharpness +
-        0.25 * size_score +
+        0.30 * sharpness +
+        0.20 * size_score +
         0.15 * brightness_score +
-        0.10 * contrast_score +
-        0.05 * det_conf +
-        0.05 * embedding_score +
-        0.025 * border_penalty +
-        0.025 * pose_penalty
+        0.15 * contrast_score +
+        0.10 * embedding_score +
+        0.05 * border_penalty +
+        0.05 * pose_penalty
     )
     
-    return quality
+    metrics = {
+        'sharpness': laplacian_var,
+        'size': relative_size,
+        'brightness': brightness,
+        'contrast': contrast,
+        'border_penalty': 1.0 - border_penalty,
+        'pose_penalty': 1.0 - pose_penalty
+    }
+    
+    return quality, metrics
 
 
 def simple_iou(box1, box2):
@@ -256,10 +243,9 @@ def extract_faces_with_tracking(video_path, sample_rate, min_face_size, app, log
                         continue
                     
                     embedding_norm = np.linalg.norm(face.embedding)
-                    
                     landmarks = face.kps if hasattr(face, 'kps') else None
                     
-                    quality_score = compute_quality_score(
+                    quality_score, metrics = compute_quality_score(
                         face_crop, 
                         [x1, y1, x2, y2], 
                         frame.shape,
@@ -274,7 +260,8 @@ def extract_faces_with_tracking(video_path, sample_rate, min_face_size, app, log
                         'embedding': face.embedding,
                         'confidence': float(face.det_score),
                         'quality_score': float(quality_score),
-                        'embedding_norm': float(embedding_norm)
+                        'embedding_norm': float(embedding_norm),
+                        'metrics': metrics
                     })
             
             if current_frame_detections:
@@ -295,8 +282,50 @@ def extract_faces_with_tracking(video_path, sample_rate, min_face_size, app, log
     return tracklets, total_frames
 
 
-def cluster_tracklets(tracklets, logger, total_frames, eps=0.28, min_samples=3):
-    logger.info(f"Clustering {len(tracklets)} tracklets")
+def find_optimal_clustering_params(tracklet_embeddings, logger):
+    """Find optimal DBSCAN parameters using silhouette analysis"""
+    
+    similarity_matrix = cosine_similarity(tracklet_embeddings)
+    distance_matrix = 1 - similarity_matrix
+    distance_matrix = np.clip(distance_matrix, 0, None)
+    
+    flat_distances = distance_matrix[np.triu_indices_from(distance_matrix, k=1)]
+    
+    percentiles = [10, 15, 20, 25, 30]
+    eps_candidates = [np.percentile(flat_distances, p) for p in percentiles]
+    
+    best_eps = eps_candidates[2]
+    best_score = -1
+    best_n_clusters = 0
+    
+    min_samples_base = max(2, len(tracklet_embeddings) // 50)
+    
+    for eps in eps_candidates:
+        clustering = DBSCAN(eps=eps, min_samples=min_samples_base, metric='precomputed')
+        labels = clustering.fit_predict(distance_matrix)
+        
+        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+        
+        if n_clusters < 2 or n_clusters > 100:
+            continue
+        
+        if n_clusters >= 2:
+            try:
+                score = silhouette_score(distance_matrix, labels, metric='precomputed')
+                if score > best_score:
+                    best_score = score
+                    best_eps = eps
+                    best_n_clusters = n_clusters
+            except:
+                pass
+    
+    logger.info(f"Optimal clustering: eps={best_eps:.3f}, expected ~{best_n_clusters} clusters, silhouette={best_score:.3f}")
+    
+    return best_eps, min_samples_base
+
+
+def cluster_tracklets_adaptive(tracklets, logger, total_frames):
+    logger.info(f"Adaptive clustering of {len(tracklets)} tracklets")
     
     tracklet_embeddings = []
     for track in tracklets:
@@ -306,6 +335,8 @@ def cluster_tracklets(tracklets, logger, total_frames, eps=0.28, min_samples=3):
     
     tracklet_embeddings = np.array(tracklet_embeddings)
     
+    eps, min_samples = find_optimal_clustering_params(tracklet_embeddings, logger)
+    
     similarity_matrix = cosine_similarity(tracklet_embeddings)
     distance_matrix = 1 - similarity_matrix
     distance_matrix = np.clip(distance_matrix, 0, None)
@@ -314,50 +345,51 @@ def cluster_tracklets(tracklets, logger, total_frames, eps=0.28, min_samples=3):
     labels = clustering.fit_predict(distance_matrix)
     
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    n_noise = list(labels).count(-1)
     
-    cluster_sizes = {}
+    cluster_sizes = defaultdict(int)
     for label in labels:
         if label != -1:
-            cluster_sizes[label] = cluster_sizes.get(label, 0) + 1
+            cluster_sizes[label] += 1
     
-    movie_duration_minutes = total_frames / (24 * 60)
-    
-    if movie_duration_minutes < 60:
-        min_tracklets = 2
-    elif movie_duration_minutes < 90:
-        min_tracklets = 3
+    sizes = list(cluster_sizes.values())
+    if len(sizes) > 0:
+        mean_size = np.mean(sizes)
+        std_size = np.std(sizes)
+        threshold = max(3, mean_size + 0.3 * std_size)
     else:
-        min_tracklets = 4
+        threshold = 3
     
-    main_characters = [label for label, size in cluster_sizes.items() if size >= min_tracklets]
+    main_characters = [label for label, size in cluster_sizes.items() if size >= threshold]
     
     filtered_labels = np.array([-1 if (label not in main_characters) else label for label in labels])
     n_filtered = len(set(filtered_labels)) - (1 if -1 in filtered_labels else 0)
     
-    logger.info(f"Clustering: {n_clusters} initial clusters, {n_filtered} characters")
+    logger.info(f"Clustering: {n_clusters} initial clusters → {n_filtered} main characters (threshold={threshold:.1f} tracklets)")
     
     return filtered_labels, tracklet_embeddings
 
 
-def farthest_point_sampling(embeddings, qualities, k=5):
-    n = len(embeddings)
-    if n <= k:
-        return list(range(n))
+def compute_adaptive_thresholds(all_detections, logger):
+    """Compute movie-specific quality thresholds"""
     
-    selected_indices = [np.argmax(qualities)]
+    sharpness_values = [d['metrics']['sharpness'] for d in all_detections if 'metrics' in d]
+    brightness_values = [d['metrics']['brightness'] for d in all_detections if 'metrics' in d]
+    contrast_values = [d['metrics']['contrast'] for d in all_detections if 'metrics' in d]
+    size_values = [d['metrics']['size'] for d in all_detections if 'metrics' in d]
     
-    for _ in range(k - 1):
-        distances = cdist(embeddings, embeddings[selected_indices], metric='cosine')
-        min_distances = distances.min(axis=1)
-        
-        for idx in selected_indices:
-            min_distances[idx] = -np.inf
-        
-        next_idx = np.argmax(min_distances)
-        selected_indices.append(next_idx)
+    thresholds = {
+        'sharpness': np.percentile(sharpness_values, 50),
+        'brightness_min': np.percentile(brightness_values, 20),
+        'brightness_max': np.percentile(brightness_values, 80),
+        'contrast': np.percentile(contrast_values, 40),
+        'size': np.percentile(size_values, 30)
+    }
     
-    return selected_indices
+    logger.info(f"Adaptive thresholds: sharpness>{thresholds['sharpness']:.1f}, "
+                f"brightness={thresholds['brightness_min']:.1f}-{thresholds['brightness_max']:.1f}, "
+                f"contrast>{thresholds['contrast']:.1f}")
+    
+    return thresholds
 
 
 def has_text_overlay(face_crop):
@@ -385,31 +417,7 @@ def has_text_overlay(face_crop):
     return False
 
 
-def check_color_quality(face_crop):
-    hsv = cv2.cvtColor(face_crop, cv2.COLOR_BGR2HSV)
-    
-    v_channel = hsv[:, :, 2]
-    avg_brightness = v_channel.mean()
-    
-    if avg_brightness < 80:
-        return False, "too_dark"
-    
-    s_channel = hsv[:, :, 1]
-    avg_saturation = s_channel.mean()
-    
-    if avg_saturation > 180:
-        return False, "oversaturated"
-    
-    b, g, r = cv2.split(face_crop)
-    
-    color_balance = np.std([b.mean(), g.mean(), r.mean()])
-    if color_balance > 50:
-        return False, "color_cast"
-    
-    return True, "good"
-
-
-def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top_quality_percentile=90, k_prototypes=5):
+def select_prototype_set_adaptive(tracklets, labels, tracklet_embeddings, video_path, logger):
     character_prototypes = {}
     
     unique_labels = set(labels)
@@ -420,23 +428,42 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
+    all_detections = []
+    for idx in range(len(tracklets)):
+        if labels[idx] != -1:
+            all_detections.extend(tracklets[idx]['detections'])
+    
+    thresholds = compute_adaptive_thresholds(all_detections, logger)
+    
     for label in tqdm(unique_labels, desc="Building prototype sets", leave=False):
         cluster_indices = np.where(labels == label)[0]
         
-        all_detections = []
+        cluster_detections = []
         for idx in cluster_indices:
-            all_detections.extend(tracklets[idx]['detections'])
+            cluster_detections.extend(tracklets[idx]['detections'])
         
-        if not all_detections:
+        if not cluster_detections:
             continue
         
         cluster_centroid = tracklet_embeddings[cluster_indices].mean(axis=0)
         
         candidate_faces = []
         
-        for det in all_detections:
+        for det in cluster_detections:
             frame_idx = det['frame_idx']
             bbox = det['bbox']
+            
+            if det['metrics']['sharpness'] < thresholds['sharpness']:
+                continue
+            
+            if det['metrics']['brightness'] < thresholds['brightness_min'] or det['metrics']['brightness'] > thresholds['brightness_max']:
+                continue
+            
+            if det['metrics']['contrast'] < thresholds['contrast']:
+                continue
+            
+            if det['metrics']['size'] < thresholds['size']:
+                continue
             
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
@@ -449,9 +476,6 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
             face_width = x2 - x1
             face_height = y2 - y1
             
-            if face_width < 60 or face_height < 60:
-                continue
-            
             padding_h = int(face_height * 0.25)
             padding_w = int(face_width * 0.25)
             
@@ -459,10 +483,6 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
             y1 = max(0, y1 - padding_h)
             x2 = min(width, x2 + padding_w)
             y2 = min(height, y2 + padding_h)
-            
-            margin = 15
-            if x1 < margin or y1 < margin or x2 > (width - margin) or y2 > (height - margin):
-                continue
             
             if x2 <= x1 or y2 <= y1:
                 continue
@@ -472,72 +492,28 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
             if face_crop.size == 0:
                 continue
             
-            crop_h, crop_w = face_crop.shape[:2]
-            
-            if crop_h < 60 or crop_w < 60:
-                continue
-            
             if has_text_overlay(face_crop):
                 continue
-            
-            color_ok, color_reason = check_color_quality(face_crop)
-            if not color_ok and color_reason == "too_dark":
-                continue
-            
-            gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
-            
-            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-            if laplacian_var < 100:
-                continue
-            
-            brightness = gray.mean()
-            if brightness < 50 or brightness > 200:
-                continue
-            
-            contrast = gray.std()
-            if contrast < 20:
-                continue
-            
-            sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-            sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-            edge_mag = np.sqrt(sobelx**2 + sobely**2)
-            edge_strength = edge_mag.mean()
-            
-            hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
-            hist_norm = hist.ravel() / hist.sum()
-            entropy = -np.sum(hist_norm * np.log2(hist_norm + 1e-7))
-            
-            hsv = cv2.cvtColor(face_crop, cv2.COLOR_BGR2HSV)
-            saturation = hsv[:, :, 1].mean()
             
             embedding_dist = np.linalg.norm(det['embedding'] - cluster_centroid)
             embedding_score = 1.0 / (1.0 + embedding_dist)
             
-            visual_quality = (
-                0.35 * min(laplacian_var / 1000.0, 1.0) +
-                0.25 * min(edge_strength / 50.0, 1.0) +
-                0.15 * (1.0 - abs(brightness - 127.5) / 127.5) +
-                0.15 * min(contrast / 60.0, 1.0) +
-                0.10 * min(entropy / 8.0, 1.0)
-            )
-            
-            final_score = 0.60 * visual_quality + 0.40 * embedding_score
+            final_score = 0.6 * det['quality_score'] + 0.4 * embedding_score
             
             candidate_faces.append({
                 'detection': det,
                 'crop': face_crop,
-                'visual_quality': visual_quality,
-                'embedding_score': embedding_score,
                 'final_score': final_score,
                 'frame_idx': frame_idx,
-                'bbox': [x1, y1, x2, y2],
-                'sharpness': laplacian_var
+                'bbox': [x1, y1, x2, y2]
             })
         
         if not candidate_faces:
             continue
         
         candidate_faces.sort(key=lambda x: x['final_score'], reverse=True)
+        
+        k_prototypes = min(5, max(3, len(candidate_faces) // 20))
         
         top_candidates = candidate_faces[:min(k_prototypes * 10, len(candidate_faces))]
         
@@ -570,17 +546,18 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
                     'bbox': proto['bbox'],
                     'embedding': proto['detection']['embedding'],
                     'confidence': proto['detection']['confidence'],
-                    'quality_score': proto['visual_quality']
+                    'quality_score': proto['final_score']
                 })
             
             character_prototypes[f"character_{label}"] = {
                 'prototypes': prototypes_data,
                 'mean_embedding': cluster_centroid,
                 'num_tracklets': len(cluster_indices),
-                'total_detections': len(all_detections)
+                'total_detections': len(cluster_detections)
             }
     
     cap.release()
+    logger.info(f"Selected prototypes for {len(character_prototypes)} characters")
     return character_prototypes
 
 
@@ -633,17 +610,6 @@ def extract_prototype_images(video_path, character_prototypes, output_dir, logge
                 continue
             
             x1, y1, x2, y2 = bbox
-            
-            face_width = x2 - x1
-            face_height = y2 - y1
-            
-            padding_h = int(face_height * 0.5)
-            padding_w = int(face_width * 0.5)
-            
-            x1 = max(0, x1 - padding_w)
-            y1 = max(0, y1 - padding_h)
-            x2 = min(width, x2 + padding_w)
-            y2 = min(height, y2 + padding_h)
             
             if x2 <= x1 or y2 <= y1:
                 continue
@@ -827,7 +793,7 @@ def generate_summary_report(frame_matches, character_prototypes):
             char_appearances[char] += 1
     
     report = f"""
-FACE MATCHING SUMMARY REPORT
+ADAPTIVE FACE MATCHING SUMMARY REPORT
 
 VIDEO ANALYSIS:
 - Total test frames processed: {total_frames}
@@ -874,6 +840,7 @@ def process_single_video(video_path, output_root, args):
         logger = setup_logging(output_dir)
         logger.info(f"Processing video: {video_path}")
         logger.info(f"Output directory: {output_dir}")
+        logger.info("ADAPTIVE PIPELINE - Auto-tuning all parameters")
         
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
         
@@ -899,12 +866,10 @@ def process_single_video(video_path, output_root, args):
             logger.warning("No tracklets found in video")
             return False
         
-        labels, tracklet_embeddings = cluster_tracklets(tracklets, logger, total_frames)
+        labels, tracklet_embeddings = cluster_tracklets_adaptive(tracklets, logger, total_frames)
         
-        character_prototypes = select_prototype_set(
-            tracklets, labels, tracklet_embeddings, video_path,
-            top_quality_percentile=args['quality_percentile'],
-            k_prototypes=args['k_prototypes']
+        character_prototypes = select_prototype_set_adaptive(
+            tracklets, labels, tracklet_embeddings, video_path, logger
         )
         
         logger.info(f"Built prototype sets for {len(character_prototypes)} characters")
@@ -970,9 +935,8 @@ def process_videos_batch(video_files, output_root, args):
     
     print(f"\nStarting batch processing")
     print(f"Total videos: {total_videos}")
-    print(f"Model: buffalo_l + tracklet-based prototypes")
-    print(f"Prototypes per character: {args.k_prototypes}")
-    print(f"Quality filtering: top {args.quality_percentile}%")
+    print(f"Model: buffalo_l + ADAPTIVE PIPELINE")
+    print(f"Auto-tuning: clustering, thresholds, prototypes")
     print(f"GPUs: 2")
     print(f"Max concurrent tasks: 8")
     
@@ -982,9 +946,7 @@ def process_videos_batch(video_files, output_root, args):
         'num_test_frames': args.num_test_frames,
         'sample_rate': args.sample_rate,
         'min_face_size': args.min_face_size,
-        'similarity_threshold': args.similarity_threshold,
-        'k_prototypes': args.k_prototypes,
-        'quality_percentile': args.quality_percentile
+        'similarity_threshold': args.similarity_threshold
     }
     
     futures = [process_single_video.remote(video_path, output_root, args_dict) for video_path in video_files]
@@ -1029,17 +991,15 @@ def process_videos_batch(video_files, output_root, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Research-Grade Movie Character Recognition Pipeline')
+    parser = argparse.ArgumentParser(description='Adaptive Movie Character Recognition Pipeline')
     
     parser.add_argument('--videos-dir', type=str, default='/mnt/data/data_hub/movies_dataset/videos')
     parser.add_argument('--output-dir', type=str, default='/mnt/data/data_hub/movies_dataset/face_extraction')
     parser.add_argument('--num-test-frames', type=int, default=150)
     parser.add_argument('--sample-rate', type=int, default=30)
     parser.add_argument('--min-face-size', type=int, default=50)
-    parser.add_argument('--similarity-threshold', type=float, default=0.20)
+    parser.add_argument('--similarity-threshold', type=float, default=0.22)
     parser.add_argument('--max-folders', type=int, default=None)
-    parser.add_argument('--k-prototypes', type=int, default=5)
-    parser.add_argument('--quality-percentile', type=int, default=90)
     
     args = parser.parse_args()
     
