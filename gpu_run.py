@@ -291,14 +291,16 @@ def find_optimal_clustering_params(tracklet_embeddings, logger):
     
     flat_distances = distance_matrix[np.triu_indices_from(distance_matrix, k=1)]
     
-    percentiles = [10, 15, 20, 25, 30]
+    # Try wider range of eps values (more clusters)
+    percentiles = [20, 25, 30, 35, 40, 45]
     eps_candidates = [np.percentile(flat_distances, p) for p in percentiles]
     
-    best_eps = eps_candidates[2]
+    best_eps = eps_candidates[2]  # Default to middle
     best_score = -1
     best_n_clusters = 0
     
-    min_samples_base = max(2, len(tracklet_embeddings) // 50)
+    # Lower min_samples for more clusters
+    min_samples_base = max(2, len(tracklet_embeddings) // 100)
     
     for eps in eps_candidates:
         clustering = DBSCAN(eps=eps, min_samples=min_samples_base, metric='precomputed')
@@ -306,18 +308,30 @@ def find_optimal_clustering_params(tracklet_embeddings, logger):
         
         n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
         
-        if n_clusters < 2 or n_clusters > 100:
+        # Want 5-50 clusters for a typical movie
+        if n_clusters < 5 or n_clusters > 80:
             continue
         
-        if n_clusters >= 2:
+        if n_clusters >= 5:
             try:
                 score = silhouette_score(distance_matrix, labels, metric='precomputed')
-                if score > best_score:
+                
+                # Prefer more clusters if silhouette is close
+                adjusted_score = score - 0.05 * abs(n_clusters - 20) / 20.0
+                
+                if adjusted_score > best_score:
                     best_score = score
                     best_eps = eps
                     best_n_clusters = n_clusters
             except:
                 pass
+    
+    # If no good eps found, use higher percentile (more clusters)
+    if best_n_clusters < 5:
+        best_eps = np.percentile(flat_distances, 35)
+        clustering = DBSCAN(eps=best_eps, min_samples=min_samples_base, metric='precomputed')
+        labels = clustering.fit_predict(distance_matrix)
+        best_n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     
     logger.info(f"Optimal clustering: eps={best_eps:.3f}, expected ~{best_n_clusters} clusters, silhouette={best_score:.3f}")
     
@@ -355,9 +369,10 @@ def cluster_tracklets_adaptive(tracklets, logger, total_frames):
     if len(sizes) > 0:
         mean_size = np.mean(sizes)
         std_size = np.std(sizes)
-        threshold = max(3, mean_size + 0.3 * std_size)
+        # More lenient - keep clusters above mean (not mean + 0.3*std)
+        threshold = max(2, mean_size)
     else:
-        threshold = 3
+        threshold = 2
     
     main_characters = [label for label, size in cluster_sizes.items() if size >= threshold]
     
@@ -365,6 +380,7 @@ def cluster_tracklets_adaptive(tracklets, logger, total_frames):
     n_filtered = len(set(filtered_labels)) - (1 if -1 in filtered_labels else 0)
     
     logger.info(f"Clustering: {n_clusters} initial clusters → {n_filtered} main characters (threshold={threshold:.1f} tracklets)")
+    logger.info(f"Cluster sizes: min={min(sizes) if sizes else 0}, max={max(sizes) if sizes else 0}, mean={mean_size:.1f}")
     
     return filtered_labels, tracklet_embeddings
 
@@ -998,7 +1014,7 @@ def main():
     parser.add_argument('--num-test-frames', type=int, default=150)
     parser.add_argument('--sample-rate', type=int, default=30)
     parser.add_argument('--min-face-size', type=int, default=50)
-    parser.add_argument('--similarity-threshold', type=float, default=0.22)
+    parser.add_argument('--similarity-threshold', type=float, default=0.18)
     parser.add_argument('--max-folders', type=int, default=None)
     
     args = parser.parse_args()
