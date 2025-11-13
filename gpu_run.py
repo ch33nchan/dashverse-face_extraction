@@ -111,7 +111,7 @@ def simple_iou(box1, box2):
     return intersection / union if union > 0 else 0.0
 
 
-def build_tracklets(face_detections, iou_threshold=0.3, max_frame_gap=10):
+def build_tracklets(face_detections, iou_threshold=0.2, max_frame_gap=30):
     tracklets = []
     active_tracks = []
     
@@ -156,7 +156,7 @@ def build_tracklets(face_detections, iou_threshold=0.3, max_frame_gap=10):
     
     tracklets.extend(active_tracks)
     
-    return [t for t in tracklets if len(t['detections']) >= 3]
+    return [t for t in tracklets if len(t['detections']) >= 2]
 
 
 def extract_faces_with_tracking(video_path, sample_rate, min_face_size, app, logger):
@@ -607,7 +607,7 @@ CHARACTER APPEARANCES IN TEST FRAMES:
     return report
 
 
-@ray.remote(num_gpus=0.125, num_cpus=1)
+@ray.remote(num_gpus=0.25, num_cpus=1)
 def process_single_video(video_path, output_root, args):
     try:
         video_name = Path(video_path).stem
@@ -634,13 +634,19 @@ def process_single_video(video_path, output_root, args):
         
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
         
+        import torch
+        if torch.cuda.is_available():
+            gpu_id = ray.get_gpu_ids()[0] if ray.get_gpu_ids() else 0
+        else:
+            gpu_id = -1
+        
         app = FaceAnalysis(
             name='buffalo_l',
             providers=providers
         )
-        app.prepare(ctx_id=0, det_size=(640, 640))
+        app.prepare(ctx_id=gpu_id, det_size=(640, 640))
         
-        logger.info("Model: buffalo_l with tracklet-based prototypes")
+        logger.info(f"Model: buffalo_l on GPU {gpu_id}")
         
         tracklets, total_frames = extract_faces_with_tracking(
             video_path, args['sample_rate'], args['min_face_size'], app, logger
@@ -725,9 +731,9 @@ def process_videos_batch(video_files, output_root, args):
     print(f"Prototypes per character: {args.k_prototypes}")
     print(f"Quality filtering: top {args.quality_percentile}%")
     print(f"GPUs: 2")
-    print(f"Max concurrent tasks: 16")
+    print(f"Max concurrent tasks: 8")
     
-    ray.init(num_gpus=2, num_cpus=16)
+    ray.init(num_gpus=2, num_cpus=8)
     
     args_dict = {
         'num_test_frames': args.num_test_frames,
