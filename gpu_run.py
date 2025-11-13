@@ -289,51 +289,58 @@ def find_optimal_clustering_params(tracklet_embeddings, logger):
     distance_matrix = 1 - similarity_matrix
     distance_matrix = np.clip(distance_matrix, 0, None)
     
+    # Debug: show similarity distribution
+    flat_sims = similarity_matrix[np.triu_indices_from(similarity_matrix, k=1)]
+    logger.info(f"Similarity stats: min={flat_sims.min():.3f}, max={flat_sims.max():.3f}, "
+                f"mean={flat_sims.mean():.3f}, median={np.median(flat_sims):.3f}")
+    logger.info(f"Similarity percentiles: 10%={np.percentile(flat_sims, 10):.3f}, "
+                f"25%={np.percentile(flat_sims, 25):.3f}, 50%={np.percentile(flat_sims, 50):.3f}, "
+                f"75%={np.percentile(flat_sims, 75):.3f}, 90%={np.percentile(flat_sims, 90):.3f}")
+    
     flat_distances = distance_matrix[np.triu_indices_from(distance_matrix, k=1)]
     
-    # Try wider range of eps values (more clusters)
-    percentiles = [20, 25, 30, 35, 40, 45]
-    eps_candidates = [np.percentile(flat_distances, p) for p in percentiles]
+    # Try many eps values
+    eps_candidates = [0.25, 0.28, 0.30, 0.32, 0.35, 0.38, 0.40, 0.42, 0.45, 0.48, 0.50]
     
-    best_eps = eps_candidates[2]  # Default to middle
+    logger.info(f"Testing {len(eps_candidates)} eps values...")
+    
+    best_eps = 0.35  # Safe default
     best_score = -1
     best_n_clusters = 0
     
-    # Lower min_samples for more clusters
-    min_samples_base = max(2, len(tracklet_embeddings) // 100)
+    min_samples_base = 2  # Very low to allow small clusters
     
     for eps in eps_candidates:
         clustering = DBSCAN(eps=eps, min_samples=min_samples_base, metric='precomputed')
         labels = clustering.fit_predict(distance_matrix)
         
         n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+        n_noise = list(labels).count(-1)
         
-        # Want 5-50 clusters for a typical movie
-        if n_clusters < 5 or n_clusters > 80:
-            continue
+        logger.info(f"  eps={eps:.2f}: {n_clusters} clusters, {n_noise} noise points")
         
-        if n_clusters >= 5:
+        # Want 8-40 clusters for a typical movie
+        if n_clusters >= 8 and n_clusters <= 40:
             try:
                 score = silhouette_score(distance_matrix, labels, metric='precomputed')
+                logger.info(f"    silhouette={score:.3f}")
                 
-                # Prefer more clusters if silhouette is close
-                adjusted_score = score - 0.05 * abs(n_clusters - 20) / 20.0
-                
-                if adjusted_score > best_score:
+                if score > best_score or (score > 0.2 and n_clusters > best_n_clusters):
                     best_score = score
                     best_eps = eps
                     best_n_clusters = n_clusters
-            except:
-                pass
+            except Exception as e:
+                logger.info(f"    silhouette failed: {e}")
     
-    # If no good eps found, use higher percentile (more clusters)
+    # If still only 1-2 clusters, force higher eps
     if best_n_clusters < 5:
-        best_eps = np.percentile(flat_distances, 35)
+        logger.warning(f"Too few clusters ({best_n_clusters}), forcing eps=0.40")
+        best_eps = 0.40
         clustering = DBSCAN(eps=best_eps, min_samples=min_samples_base, metric='precomputed')
         labels = clustering.fit_predict(distance_matrix)
         best_n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     
-    logger.info(f"Optimal clustering: eps={best_eps:.3f}, expected ~{best_n_clusters} clusters, silhouette={best_score:.3f}")
+    logger.info(f"SELECTED: eps={best_eps:.3f}, expected {best_n_clusters} clusters, silhouette={best_score:.3f}")
     
     return best_eps, min_samples_base
 
