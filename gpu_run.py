@@ -635,10 +635,10 @@ def process_single_video(video_path, output_root, args):
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
         
         import torch
-        if torch.cuda.is_available():
-            gpu_id = ray.get_gpu_ids()[0] if ray.get_gpu_ids() else 0
+        if torch.cuda.is_available() and ray.get_gpu_ids():
+            gpu_id = int(ray.get_gpu_ids()[0])
         else:
-            gpu_id = -1
+            gpu_id = 0
         
         app = FaceAnalysis(
             name='buffalo_l',
