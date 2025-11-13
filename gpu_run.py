@@ -59,7 +59,28 @@ def get_video_files(videos_dir, max_folders=None):
     return video_files
 
 
-def compute_quality_score(face_crop, bbox, frame_shape, det_conf, embedding_norm):
+def estimate_head_pose_simple(face_landmarks):
+    if face_landmarks is None or len(face_landmarks) < 5:
+        return 0.0
+    
+    left_eye = face_landmarks[0]
+    right_eye = face_landmarks[1]
+    nose = face_landmarks[2]
+    
+    eye_center_x = (left_eye[0] + right_eye[0]) / 2
+    
+    face_width = abs(right_eye[0] - left_eye[0])
+    if face_width < 1:
+        return 0.0
+    
+    nose_offset = (nose[0] - eye_center_x) / face_width
+    
+    yaw_angle = nose_offset * 90
+    
+    return abs(yaw_angle)
+
+
+def compute_quality_score(face_crop, bbox, frame_shape, det_conf, embedding_norm, landmarks=None):
     h, w = face_crop.shape[:2]
     frame_h, frame_w = frame_shape[:2]
     
@@ -83,12 +104,21 @@ def compute_quality_score(face_crop, bbox, frame_shape, det_conf, embedding_norm
     
     embedding_score = min(embedding_norm / 20.0, 1.0)
     
+    pose_penalty = 0.0
+    if landmarks is not None:
+        yaw = estimate_head_pose_simple(landmarks)
+        if yaw > 25:
+            pose_penalty = 0.4
+        elif yaw > 15:
+            pose_penalty = 0.2
+    
     quality = (
-        0.30 * sharpness +
-        0.25 * relative_size +
-        0.20 * det_conf +
+        0.25 * sharpness +
+        0.20 * relative_size +
+        0.15 * det_conf +
         0.15 * embedding_score +
-        0.10 * (1.0 - border_penalty)
+        0.10 * (1.0 - border_penalty) +
+        0.15 * (1.0 - pose_penalty)
     )
     
     return quality
@@ -204,12 +234,15 @@ def extract_faces_with_tracking(video_path, sample_rate, min_face_size, app, log
                     
                     embedding_norm = np.linalg.norm(face.embedding)
                     
+                    landmarks = face.kps if hasattr(face, 'kps') else None
+                    
                     quality_score = compute_quality_score(
                         face_crop, 
                         [x1, y1, x2, y2], 
                         frame.shape,
                         float(face.det_score),
-                        embedding_norm
+                        embedding_norm,
+                        landmarks
                     )
                     
                     current_frame_detections.append({
