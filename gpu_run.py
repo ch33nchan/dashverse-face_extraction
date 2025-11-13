@@ -299,12 +299,12 @@ def find_optimal_clustering_params(tracklet_embeddings, logger):
     
     flat_distances = distance_matrix[np.triu_indices_from(distance_matrix, k=1)]
     
-    # Try many eps values
-    eps_candidates = [0.25, 0.28, 0.30, 0.32, 0.35, 0.38, 0.40, 0.42, 0.45, 0.48, 0.50]
+    # Try very aggressive eps values to force many clusters
+    eps_candidates = [0.35, 0.38, 0.40, 0.42, 0.45, 0.48, 0.50, 0.52, 0.55, 0.58, 0.60]
     
     logger.info(f"Testing {len(eps_candidates)} eps values...")
     
-    best_eps = 0.35  # Safe default
+    best_eps = 0.45  # Higher default for more clusters
     best_score = -1
     best_n_clusters = 0
     
@@ -319,23 +319,29 @@ def find_optimal_clustering_params(tracklet_embeddings, logger):
         
         logger.info(f"  eps={eps:.2f}: {n_clusters} clusters, {n_noise} noise points")
         
-        # Want 8-40 clusters for a typical movie
-        if n_clusters >= 8 and n_clusters <= 40:
+        # Want 10-50 clusters for a typical movie
+        if n_clusters >= 10 and n_clusters <= 60:
             try:
                 score = silhouette_score(distance_matrix, labels, metric='precomputed')
                 logger.info(f"    silhouette={score:.3f}")
                 
-                if score > best_score or (score > 0.2 and n_clusters > best_n_clusters):
+                # Prioritize more clusters
+                if n_clusters > best_n_clusters or (n_clusters == best_n_clusters and score > best_score):
                     best_score = score
                     best_eps = eps
                     best_n_clusters = n_clusters
             except Exception as e:
                 logger.info(f"    silhouette failed: {e}")
+        elif n_clusters > 10:
+            # Even if too many clusters, consider it
+            best_eps = eps
+            best_n_clusters = n_clusters
+            break
     
-    # If still only 1-2 clusters, force higher eps
-    if best_n_clusters < 5:
-        logger.warning(f"Too few clusters ({best_n_clusters}), forcing eps=0.40")
-        best_eps = 0.40
+    # If still only 1-5 clusters, force very high eps
+    if best_n_clusters < 6:
+        logger.warning(f"Too few clusters ({best_n_clusters}), forcing eps=0.50")
+        best_eps = 0.50
         clustering = DBSCAN(eps=best_eps, min_samples=min_samples_base, metric='precomputed')
         labels = clustering.fit_predict(distance_matrix)
         best_n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
@@ -374,12 +380,12 @@ def cluster_tracklets_adaptive(tracklets, logger, total_frames):
     
     sizes = list(cluster_sizes.values())
     if len(sizes) > 0:
-        mean_size = np.mean(sizes)
-        std_size = np.std(sizes)
-        # More lenient - keep clusters above mean (not mean + 0.3*std)
-        threshold = max(2, mean_size)
+        # Use median instead of mean (robust to outliers)
+        median_size = np.median(sizes)
+        # Keep clusters above 1/3 of median, or at least 3
+        threshold = max(3, median_size / 3)
     else:
-        threshold = 2
+        threshold = 3
     
     main_characters = [label for label, size in cluster_sizes.items() if size >= threshold]
     
@@ -387,7 +393,12 @@ def cluster_tracklets_adaptive(tracklets, logger, total_frames):
     n_filtered = len(set(filtered_labels)) - (1 if -1 in filtered_labels else 0)
     
     logger.info(f"Clustering: {n_clusters} initial clusters → {n_filtered} main characters (threshold={threshold:.1f} tracklets)")
-    logger.info(f"Cluster sizes: min={min(sizes) if sizes else 0}, max={max(sizes) if sizes else 0}, mean={mean_size:.1f}")
+    logger.info(f"Cluster sizes: min={min(sizes) if sizes else 0}, max={max(sizes) if sizes else 0}, "
+                f"mean={np.mean(sizes):.1f}, median={median_size:.1f}")
+    
+    # Show top 10 largest clusters
+    sorted_sizes = sorted(cluster_sizes.items(), key=lambda x: x[1], reverse=True)[:10]
+    logger.info(f"Top clusters: {[(f'c{k}', v) for k, v in sorted_sizes]}")
     
     return filtered_labels, tracklet_embeddings
 
