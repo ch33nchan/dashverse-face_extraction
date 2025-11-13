@@ -1,8 +1,7 @@
 import argparse
 import cv2
 import numpy as np
-import torch
-import torch.nn.functional as F
+from insightface.app import FaceAnalysis
 from sklearn.cluster import DBSCAN
 from sklearn.metrics.pairwise import cosine_similarity
 import matplotlib
@@ -23,7 +22,7 @@ import traceback
 import ray
 import time
 import shutil
-from facenet_pytorch import MTCNN, InceptionResnetV1
+from scipy.spatial.distance import cdist
 
 warnings.filterwarnings('ignore')
 
@@ -60,85 +59,291 @@ def get_video_files(videos_dir, max_folders=None):
     return video_files
 
 
-def calculate_multi_scale_quality(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-    h, w = gray.shape
+def compute_quality_score(face_crop, bbox, frame_shape, det_conf, embedding_norm):
+    h, w = face_crop.shape[:2]
+    frame_h, frame_w = frame_shape[:2]
     
-    if h < 50 or w < 50:
+    if h < 10 or w < 10:
         return 0.0
     
-    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-    sharpness = min(lap_var / 1000.0, 1.0)
+    gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY) if len(face_crop.shape) == 3 else face_crop
     
-    sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-    sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-    edge_strength = np.sqrt(sobelx**2 + sobely**2).mean()
-    edge_score = min(edge_strength / 50.0, 1.0)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    sharpness = min(laplacian_var / 1000.0, 1.0)
     
-    brightness = gray.mean()
-    brightness_score = 1.0 - abs(brightness - 127.5) / 127.5
+    bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+    frame_area = frame_h * frame_w
+    relative_size = min(bbox_area / frame_area, 0.5) * 2.0
     
-    hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
-    hist_norm = hist.ravel() / hist.sum()
-    entropy = -np.sum(hist_norm * np.log2(hist_norm + 1e-7))
-    entropy_score = min(entropy / 8.0, 1.0)
+    x1, y1, x2, y2 = bbox
+    border_penalty = 0.0
+    margin = 10
+    if x1 < margin or y1 < margin or x2 > (frame_w - margin) or y2 > (frame_h - margin):
+        border_penalty = 0.3
     
-    contrast = gray.std()
-    contrast_score = min(contrast / 64.0, 1.0)
+    embedding_score = min(embedding_norm / 20.0, 1.0)
     
-    size_score = min((h * w) / 10000.0, 1.0)
-    
-    quality_score = (sharpness * 0.30 + edge_score * 0.20 + brightness_score * 0.15 + 
-                     entropy_score * 0.10 + contrast_score * 0.10 + size_score * 0.15)
-    
-    return quality_score
-
-
-def calculate_aesthetic_score(image):
-    if len(image.shape) == 2:
-        gray = image
-        color = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    else:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        color = image
-    
-    h, w = gray.shape
-    
-    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-    sharpness_score = min(lap_var / 1000.0, 1.0)
-    
-    brightness = gray.mean()
-    brightness_score = 1.0 - abs(brightness - 130) / 130.0
-    brightness_score = max(0, brightness_score)
-    
-    contrast = gray.std()
-    contrast_score = min(contrast / 70.0, 1.0)
-    
-    if len(image.shape) == 3:
-        hsv = cv2.cvtColor(color, cv2.COLOR_BGR2HSV)
-        saturation = hsv[:, :, 1].mean()
-        vibrancy_score = min(saturation / 128.0, 1.0)
-    else:
-        vibrancy_score = 0.5
-    
-    overexposed = np.sum(gray > 240) / gray.size
-    underexposed = np.sum(gray < 20) / gray.size
-    exposure_score = 1.0 - (overexposed + underexposed)
-    
-    edges = cv2.Canny(gray, 100, 200)
-    edge_density = np.sum(edges > 0) / edges.size
-    edge_score = min(edge_density / 0.15, 1.0)
-    
-    aesthetic_score = (
-        sharpness_score * 0.25 +
-        brightness_score * 0.20 +
-        contrast_score * 0.15 +
-        vibrancy_score * 0.15 +
-        exposure_score * 0.15 +
-        edge_score * 0.10
+    quality = (
+        0.30 * sharpness +
+        0.25 * relative_size +
+        0.20 * det_conf +
+        0.15 * embedding_score +
+        0.10 * (1.0 - border_penalty)
     )
     
-    return aesthetic_score
+    return quality
+
+
+def simple_iou(box1, box2):
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    if x2 < x1 or y2 < y1:
+        return 0.0
+    
+    intersection = (x2 - x1) * (y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - intersection
+    
+    return intersection / union if union > 0 else 0.0
+
+
+def build_tracklets(face_detections, iou_threshold=0.3, max_frame_gap=10):
+    tracklets = []
+    active_tracks = []
+    
+    for frame_idx in sorted(face_detections.keys()):
+        current_detections = face_detections[frame_idx]
+        
+        matched = set()
+        
+        for track in active_tracks:
+            if frame_idx - track['last_frame'] > max_frame_gap:
+                tracklets.append(track)
+                continue
+            
+            last_bbox = track['detections'][-1]['bbox']
+            
+            best_iou = 0
+            best_det_idx = -1
+            
+            for det_idx, det in enumerate(current_detections):
+                if det_idx in matched:
+                    continue
+                iou = simple_iou(last_bbox, det['bbox'])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_det_idx = det_idx
+            
+            if best_iou > iou_threshold:
+                track['detections'].append(current_detections[best_det_idx])
+                track['last_frame'] = frame_idx
+                matched.add(best_det_idx)
+        
+        active_tracks = [t for t in active_tracks if frame_idx - t['last_frame'] <= max_frame_gap]
+        
+        for det_idx, det in enumerate(current_detections):
+            if det_idx not in matched:
+                new_track = {
+                    'detections': [det],
+                    'last_frame': frame_idx,
+                    'start_frame': frame_idx
+                }
+                active_tracks.append(new_track)
+    
+    tracklets.extend(active_tracks)
+    
+    return [t for t in tracklets if len(t['detections']) >= 3]
+
+
+def extract_faces_with_tracking(video_path, sample_rate, min_face_size, app, logger):
+    logger.info(f"Opening video: {video_path}")
+    cap = cv2.VideoCapture(video_path)
+    
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video file: {video_path}")
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    logger.info(f"Video properties: {total_frames} frames, {fps:.2f} FPS, {width}x{height}")
+    
+    face_detections = {}
+    
+    frame_idx = 0
+    frames_to_process = total_frames // sample_rate
+    
+    pbar = tqdm(total=frames_to_process, desc="Extracting faces", unit="frame", leave=False)
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        if frame_idx % sample_rate == 0:
+            faces = app.get(frame)
+            
+            current_frame_detections = []
+            
+            for face in faces:
+                bbox = face.bbox.astype(int)
+                x1, y1, x2, y2 = bbox
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(width, x2), min(height, y2)
+                
+                if (x2 - x1) >= min_face_size and (y2 - y1) >= min_face_size:
+                    face_crop = frame[y1:y2, x1:x2]
+                    
+                    if face_crop.size == 0:
+                        continue
+                    
+                    embedding_norm = np.linalg.norm(face.embedding)
+                    
+                    quality_score = compute_quality_score(
+                        face_crop, 
+                        [x1, y1, x2, y2], 
+                        frame.shape,
+                        float(face.det_score),
+                        embedding_norm
+                    )
+                    
+                    current_frame_detections.append({
+                        'frame_idx': int(frame_idx),
+                        'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                        'embedding': face.embedding,
+                        'confidence': float(face.det_score),
+                        'quality_score': float(quality_score),
+                        'embedding_norm': float(embedding_norm)
+                    })
+            
+            if current_frame_detections:
+                face_detections[frame_idx] = current_frame_detections
+            
+            pbar.update(1)
+        
+        frame_idx += 1
+    
+    cap.release()
+    pbar.close()
+    
+    logger.info(f"Building tracklets from {len(face_detections)} frames")
+    tracklets = build_tracklets(face_detections)
+    
+    logger.info(f"Built {len(tracklets)} tracklets")
+    
+    return tracklets, total_frames
+
+
+def cluster_tracklets(tracklets, logger, total_frames, eps=0.28, min_samples=3):
+    logger.info(f"Clustering {len(tracklets)} tracklets")
+    
+    tracklet_embeddings = []
+    for track in tracklets:
+        embeddings = np.array([d['embedding'] for d in track['detections']])
+        mean_embedding = embeddings.mean(axis=0)
+        tracklet_embeddings.append(mean_embedding)
+    
+    tracklet_embeddings = np.array(tracklet_embeddings)
+    
+    similarity_matrix = cosine_similarity(tracklet_embeddings)
+    distance_matrix = 1 - similarity_matrix
+    distance_matrix = np.clip(distance_matrix, 0, None)
+    
+    clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='precomputed')
+    labels = clustering.fit_predict(distance_matrix)
+    
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    n_noise = list(labels).count(-1)
+    
+    cluster_sizes = {}
+    for label in labels:
+        if label != -1:
+            cluster_sizes[label] = cluster_sizes.get(label, 0) + 1
+    
+    movie_duration_minutes = total_frames / (24 * 60)
+    
+    if movie_duration_minutes < 60:
+        min_tracklets = 2
+    elif movie_duration_minutes < 90:
+        min_tracklets = 3
+    else:
+        min_tracklets = 4
+    
+    main_characters = [label for label, size in cluster_sizes.items() if size >= min_tracklets]
+    
+    filtered_labels = np.array([-1 if (label not in main_characters) else label for label in labels])
+    n_filtered = len(set(filtered_labels)) - (1 if -1 in filtered_labels else 0)
+    
+    logger.info(f"Clustering: {n_clusters} initial clusters, {n_filtered} characters")
+    
+    return filtered_labels, tracklet_embeddings
+
+
+def farthest_point_sampling(embeddings, qualities, k=5):
+    n = len(embeddings)
+    if n <= k:
+        return list(range(n))
+    
+    selected_indices = [np.argmax(qualities)]
+    
+    for _ in range(k - 1):
+        distances = cdist(embeddings, embeddings[selected_indices], metric='cosine')
+        min_distances = distances.min(axis=1)
+        
+        for idx in selected_indices:
+            min_distances[idx] = -np.inf
+        
+        next_idx = np.argmax(min_distances)
+        selected_indices.append(next_idx)
+    
+    return selected_indices
+
+
+def select_prototype_set(tracklets, labels, tracklet_embeddings, top_quality_percentile=70, k_prototypes=8):
+    character_prototypes = {}
+    
+    unique_labels = set(labels)
+    if -1 in unique_labels:
+        unique_labels.remove(-1)
+    
+    for label in tqdm(unique_labels, desc="Building prototype sets", leave=False):
+        cluster_indices = np.where(labels == label)[0]
+        
+        all_detections = []
+        for idx in cluster_indices:
+            all_detections.extend(tracklets[idx]['detections'])
+        
+        if not all_detections:
+            continue
+        
+        qualities = np.array([d['quality_score'] for d in all_detections])
+        quality_threshold = np.percentile(qualities, top_quality_percentile)
+        
+        high_quality_detections = [d for d in all_detections if d['quality_score'] >= quality_threshold]
+        
+        if not high_quality_detections:
+            high_quality_detections = all_detections
+        
+        hq_embeddings = np.array([d['embedding'] for d in high_quality_detections])
+        hq_qualities = np.array([d['quality_score'] for d in high_quality_detections])
+        
+        prototype_indices = farthest_point_sampling(hq_embeddings, hq_qualities, min(k_prototypes, len(hq_embeddings)))
+        
+        prototypes = [high_quality_detections[i] for i in prototype_indices]
+        
+        character_prototypes[f"character_{label}"] = {
+            'prototypes': prototypes,
+            'mean_embedding': tracklet_embeddings[cluster_indices].mean(axis=0),
+            'num_tracklets': len(cluster_indices),
+            'total_detections': len(all_detections)
+        }
+    
+    return character_prototypes
 
 
 def enhance_image(image):
@@ -167,216 +372,29 @@ def enhance_image(image):
     return enhanced
 
 
-def extract_faces_from_video(video_path, sample_rate, min_face_size, mtcnn, resnet, device, logger):
-    logger.info(f"Opening video: {video_path}")
-    cap = cv2.VideoCapture(video_path)
-    
-    if not cap.isOpened():
-        raise ValueError(f"Could not open video file: {video_path}")
-    
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    logger.info(f"Video properties: {total_frames} frames, {fps:.2f} FPS, {width}x{height}")
-    
-    all_faces = []
-    frame_indices = []
-    face_boxes = []
-    
-    frame_idx = 0
-    frames_to_process = total_frames // sample_rate
-    
-    pbar = tqdm(total=frames_to_process, desc="Extracting faces", unit="frame", leave=False)
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        if frame_idx % sample_rate == 0:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            boxes, probs = mtcnn.detect(frame_rgb)
-            
-            if boxes is not None:
-                for box, prob in zip(boxes, probs):
-                    x1, y1, x2, y2 = box.astype(int)
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(width, x2), min(height, y2)
-                    
-                    if (x2 - x1) >= min_face_size and (y2 - y1) >= min_face_size and prob > 0.9:
-                        face_crop = frame[y1:y2, x1:x2]
-                        
-                        if face_crop.size == 0:
-                            continue
-                        
-                        face_rgb_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
-                        face_tensor = torch.from_numpy(face_rgb_crop).permute(2, 0, 1).float()
-                        face_tensor = F.interpolate(face_tensor.unsqueeze(0), size=(160, 160), mode='bilinear', align_corners=False)
-                        face_tensor = (face_tensor - 127.5) / 128.0
-                        face_tensor = face_tensor.to(device)
-                        
-                        with torch.no_grad():
-                            embedding = resnet(face_tensor).cpu().numpy()[0]
-                        
-                        quality_score = calculate_multi_scale_quality(face_crop)
-                        aesthetic_score = calculate_aesthetic_score(face_crop)
-                        
-                        all_faces.append(embedding)
-                        frame_indices.append(frame_idx)
-                        face_boxes.append({
-                            'frame_idx': int(frame_idx),
-                            'bbox': [int(x1), int(y1), int(x2), int(y2)],
-                            'confidence': float(prob),
-                            'quality_score': float(quality_score),
-                            'aesthetic_score': float(aesthetic_score)
-                        })
-            
-            pbar.update(1)
-        
-        frame_idx += 1
-    
-    cap.release()
-    pbar.close()
-    
-    logger.info(f"Extraction complete: {len(all_faces)} faces from {frame_idx} frames")
-    
-    return np.array(all_faces), frame_indices, face_boxes
-
-
-def cluster_faces(embeddings, face_boxes, logger, total_frames, eps=0.32, min_samples=5):
-    logger.info(f"Clustering {len(embeddings)} faces")
-    
-    similarity_matrix = cosine_similarity(embeddings)
-    distance_matrix = 1 - similarity_matrix
-    distance_matrix = np.clip(distance_matrix, 0, None)
-    
-    clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='precomputed')
-    labels = clustering.fit_predict(distance_matrix)
-    
-    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    n_noise = list(labels).count(-1)
-    
-    cluster_sizes = {}
-    for label in labels:
-        if label != -1:
-            cluster_sizes[label] = cluster_sizes.get(label, 0) + 1
-    
-    movie_duration_minutes = total_frames / (24 * 60)
-    
-    if movie_duration_minutes < 60:
-        min_appearances = 5
-    elif movie_duration_minutes < 90:
-        min_appearances = 8
-    else:
-        min_appearances = 10
-    
-    main_characters = [label for label, size in cluster_sizes.items() if size >= min_appearances]
-    
-    filtered_labels = np.array([-1 if (label not in main_characters) else label for label in labels])
-    n_filtered = len(set(filtered_labels)) - (1 if -1 in filtered_labels else 0)
-    
-    logger.info(f"Clustering: {n_clusters} initial clusters, {n_filtered} characters (min {min_appearances} appearances)")
-    
-    return filtered_labels
-
-
-def select_best_reference_faces(embeddings, labels, face_boxes, video_path, num_candidates=15):
-    reference_faces = {}
-    
-    unique_labels = set(labels)
-    if -1 in unique_labels:
-        unique_labels.remove(-1)
-    
+def extract_prototype_images(video_path, character_prototypes, output_dir, logger):
     cap = cv2.VideoCapture(video_path)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    for label in tqdm(unique_labels, desc="Selecting references", leave=False):
-        cluster_indices = np.where(labels == label)[0]
-        cluster_boxes = [face_boxes[i] for i in cluster_indices]
+    logger.info("Extracting prototype images")
+    
+    prototype_images = {}
+    
+    for char_id, data in tqdm(character_prototypes.items(), desc="Extracting prototypes", leave=False):
+        char_images = []
         
-        quality_scores = []
-        for box in cluster_boxes:
-            base_score = (box['confidence'] * 0.3 + 
-                         box['quality_score'] * 0.3 + 
-                         box['aesthetic_score'] * 0.4)
-            quality_scores.append(base_score)
-        
-        top_candidates_idx = np.argsort(quality_scores)[-num_candidates:]
-        top_candidates = [cluster_boxes[i] for i in top_candidates_idx]
-        
-        best_frame = None
-        best_aesthetic = -1
-        best_box = None
-        
-        for candidate in top_candidates:
-            frame_idx = candidate['frame_idx']
-            bbox = candidate['bbox']
+        for proto_idx, proto in enumerate(data['prototypes']):
+            frame_idx = proto['frame_idx']
+            bbox = proto['bbox']
             
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             
-            if not ret or frame is None:
+            if not ret:
                 continue
             
             x1, y1, x2, y2 = bbox
-            
-            padding = 0.5
-            w, h = x2 - x1, y2 - y1
-            pad_w, pad_h = int(w * padding), int(h * padding)
-            
-            x1 = max(0, x1 - pad_w)
-            y1 = max(0, y1 - pad_h)
-            x2 = min(width, x2 + pad_w)
-            y2 = min(height, y2 + pad_h)
-            
-            face_crop = frame[y1:y2, x1:x2]
-            
-            if face_crop.size == 0:
-                continue
-            
-            aesthetic_score = calculate_aesthetic_score(face_crop)
-            combined_score = aesthetic_score * 0.7 + candidate['quality_score'] * 0.3
-            
-            if combined_score > best_aesthetic:
-                best_aesthetic = combined_score
-                best_frame = frame_idx
-                best_box = bbox
-        
-        if best_box is not None:
-            best_idx = cluster_indices[np.argmax(quality_scores)]
-            
-            reference_faces[f"character_{label}"] = {
-                'embedding': embeddings[best_idx],
-                'frame_idx': best_frame,
-                'bbox': best_box,
-                'confidence': face_boxes[best_idx]['confidence'],
-                'quality_score': face_boxes[best_idx]['quality_score'],
-                'aesthetic_score': best_aesthetic,
-                'cluster_size': len(cluster_indices)
-            }
-    
-    cap.release()
-    return reference_faces
-
-
-def extract_reference_images(video_path, reference_faces, output_dir, logger):
-    cap = cv2.VideoCapture(video_path)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    ref_images = {}
-    
-    logger.info("Extracting and enhancing reference images")
-    
-    for char_id, data in tqdm(reference_faces.items(), desc="Extracting references", leave=False):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, data['frame_idx'])
-        ret, frame = cap.read()
-        
-        if ret:
-            x1, y1, x2, y2 = data['bbox']
             
             face_width = x2 - x1
             face_height = y2 - y1
@@ -419,13 +437,16 @@ def extract_reference_images(video_path, reference_faces, output_dir, logger):
             
             face_rgb = cv2.cvtColor(enhanced_resized, cv2.COLOR_BGR2RGB)
             
-            ref_path = f"{output_dir}/{char_id}_reference.jpg"
+            ref_path = f"{output_dir}/{char_id}_proto_{proto_idx}.jpg"
             Image.fromarray(face_rgb).save(ref_path, quality=95)
-            ref_images[char_id] = face_rgb
+            char_images.append(face_rgb)
+        
+        if char_images:
+            prototype_images[char_id] = char_images[0]
     
     cap.release()
-    logger.info(f"Extracted {len(ref_images)} enhanced reference images")
-    return ref_images
+    logger.info(f"Extracted prototypes for {len(prototype_images)} characters")
+    return prototype_images
 
 
 def generate_test_frames_from_video(video_path, num_frames, output_dir, logger):
@@ -453,56 +474,41 @@ def generate_test_frames_from_video(video_path, num_frames, output_dir, logger):
     return saved_frames
 
 
-def match_faces_in_frame(frame, reference_faces, similarity_threshold, mtcnn, resnet, device):
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    
-    boxes, probs = mtcnn.detect(frame_rgb)
+def match_faces_in_frame(frame, character_prototypes, similarity_threshold, app):
+    faces = app.get(frame)
     
     matched_faces = []
     
-    if boxes is not None:
-        for box, prob in zip(boxes, probs):
-            bbox = box.astype(int)
-            x1, y1, x2, y2 = bbox
+    for face in faces:
+        bbox = face.bbox.astype(int)
+        embedding = face.embedding
+        
+        best_match = None
+        best_similarity = -1
+        
+        for char_id, char_data in character_prototypes.items():
+            max_sim = -1
             
-            if prob < 0.9:
-                continue
+            for proto in char_data['prototypes']:
+                proto_embedding = proto['embedding']
+                similarity = cosine_similarity([embedding], [proto_embedding])[0][0]
+                max_sim = max(max_sim, similarity)
             
-            face_crop = frame[y1:y2, x1:x2]
-            if face_crop.size == 0:
-                continue
-            
-            face_rgb_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
-            face_tensor = torch.from_numpy(face_rgb_crop).permute(2, 0, 1).float()
-            face_tensor = F.interpolate(face_tensor.unsqueeze(0), size=(160, 160), mode='bilinear', align_corners=False)
-            face_tensor = (face_tensor - 127.5) / 128.0
-            face_tensor = face_tensor.to(device)
-            
-            with torch.no_grad():
-                embedding = resnet(face_tensor).cpu().numpy()[0]
-            
-            best_match = None
-            best_similarity = -1
-            
-            for char_id, ref_data in reference_faces.items():
-                ref_embedding = ref_data['embedding']
-                similarity = cosine_similarity([embedding], [ref_embedding])[0][0]
-                
-                if similarity > best_similarity and similarity > similarity_threshold:
-                    best_similarity = similarity
-                    best_match = char_id
-            
-            matched_faces.append({
-                'bbox': bbox.tolist(),
-                'character_id': best_match,
-                'confidence': float(prob),
-                'similarity': float(best_similarity) if best_match else 0.0
-            })
+            if max_sim > best_similarity and max_sim > similarity_threshold:
+                best_similarity = max_sim
+                best_match = char_id
+        
+        matched_faces.append({
+            'bbox': bbox.tolist(),
+            'character_id': best_match,
+            'confidence': float(face.det_score),
+            'similarity': float(best_similarity) if best_match else 0.0
+        })
     
     return matched_faces
 
 
-def create_visualization(frame, matches, reference_images, frame_idx):
+def create_visualization(frame, matches, prototype_images, frame_idx):
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     
     detected_chars = [m['character_id'] for m in matches if m['character_id']]
@@ -551,8 +557,8 @@ def create_visualization(frame, matches, reference_images, frame_idx):
             axes[0].add_patch(rect)
     
     for idx, char_id in enumerate(detected_chars, 1):
-        if char_id in reference_images:
-            axes[idx].imshow(reference_images[char_id])
+        if char_id in prototype_images:
+            axes[idx].imshow(prototype_images[char_id])
             axes[idx].set_title(char_id.replace('character_', 'Character '), fontsize=12)
             axes[idx].axis('off')
     
@@ -560,7 +566,7 @@ def create_visualization(frame, matches, reference_images, frame_idx):
     return fig
 
 
-def generate_summary_report(frame_matches, reference_faces):
+def generate_summary_report(frame_matches, character_prototypes):
     total_frames = len(frame_matches)
     frames_with_faces = sum(1 for fm in frame_matches if len(fm['matches']) > 0)
     frames_no_faces = total_frames - frames_with_faces
@@ -586,8 +592,8 @@ VIDEO ANALYSIS:
 - Frames with matched characters: {frames_with_matches} ({frames_with_matches/total_frames*100:.1f}%)
 - Frames with no faces: {frames_no_faces} ({frames_no_faces/total_frames*100:.1f}%)
 
-CHARACTER REFERENCE DATABASE:
-- Total unique characters: {len(reference_faces)}
+CHARACTER DATABASE:
+- Total unique characters: {len(character_prototypes)}
 
 CHARACTER APPEARANCES IN TEST FRAMES:
 """
@@ -595,28 +601,15 @@ CHARACTER APPEARANCES IN TEST FRAMES:
     for char_id in sorted(char_appearances.keys()):
         count = char_appearances[char_id]
         percentage = count / total_frames * 100
-        report += f"- {char_id}: {count} frames ({percentage:.1f}%)\n"
+        num_prototypes = len(character_prototypes[char_id]['prototypes'])
+        report += f"- {char_id}: {count} frames ({percentage:.1f}%) [{num_prototypes} prototypes]\n"
     
     return report
 
 
-@ray.remote(num_gpus=0.25, num_cpus=1)
+@ray.remote(num_gpus=0.125, num_cpus=1)
 def process_single_video(video_path, output_root, args):
     try:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        mtcnn = MTCNN(
-            image_size=160,
-            margin=0,
-            min_face_size=50,
-            thresholds=[0.6, 0.7, 0.7],
-            factor=0.709,
-            post_process=False,
-            device=device
-        )
-        
-        resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
-        
         video_name = Path(video_path).stem
         
         existing_dirs = [d for d in os.listdir(output_root) if d.startswith(video_name + "_")]
@@ -638,28 +631,36 @@ def process_single_video(video_path, output_root, args):
         logger = setup_logging(output_dir)
         logger.info(f"Processing video: {video_path}")
         logger.info(f"Output directory: {output_dir}")
-        logger.info("Model: MTCNN + InceptionResnetV1 (VGGFace2)")
         
-        embeddings, frame_indices, face_boxes = extract_faces_from_video(
-            video_path, args['sample_rate'], args['min_face_size'], mtcnn, resnet, device, logger
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        
+        app = FaceAnalysis(
+            name='buffalo_l',
+            providers=providers
+        )
+        app.prepare(ctx_id=0, det_size=(640, 640))
+        
+        logger.info("Model: buffalo_l with tracklet-based prototypes")
+        
+        tracklets, total_frames = extract_faces_with_tracking(
+            video_path, args['sample_rate'], args['min_face_size'], app, logger
         )
         
-        if len(embeddings) == 0:
-            logger.warning("No faces found in video")
+        if len(tracklets) == 0:
+            logger.warning("No tracklets found in video")
             return False
         
-        cap = cv2.VideoCapture(video_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
+        labels, tracklet_embeddings = cluster_tracklets(tracklets, logger, total_frames)
         
-        labels = cluster_faces(embeddings, face_boxes, logger, total_frames)
-        
-        reference_faces = select_best_reference_faces(
-            embeddings, labels, face_boxes, video_path, num_candidates=args['num_candidates']
+        character_prototypes = select_prototype_set(
+            tracklets, labels, tracklet_embeddings,
+            top_quality_percentile=args['quality_percentile'],
+            k_prototypes=args['k_prototypes']
         )
-        logger.info(f"Selected {len(reference_faces)} reference faces")
         
-        reference_images = extract_reference_images(video_path, reference_faces, output_dir, logger)
+        logger.info(f"Built prototype sets for {len(character_prototypes)} characters")
+        
+        prototype_images = extract_prototype_images(video_path, character_prototypes, output_dir, logger)
         
         test_frames = generate_test_frames_from_video(video_path, args['num_test_frames'], output_dir, logger)
         
@@ -670,7 +671,7 @@ def process_single_video(video_path, output_root, args):
         frame_matches = []
         
         for frame_idx, frame_path, frame in tqdm(test_frames, desc="Processing test frames", leave=False):
-            matches = match_faces_in_frame(frame, reference_faces, args['similarity_threshold'], mtcnn, resnet, device)
+            matches = match_faces_in_frame(frame, character_prototypes, args['similarity_threshold'], app)
             
             frame_matches.append({
                 'frame_idx': int(frame_idx),
@@ -678,7 +679,7 @@ def process_single_video(video_path, output_root, args):
                 'matches': matches
             })
             
-            fig = create_visualization(frame, matches, reference_images, frame_idx)
+            fig = create_visualization(frame, matches, prototype_images, frame_idx)
             output_path = f"{viz_dir}/frame_{int(frame_idx):06d}_viz.jpg"
             fig.savefig(output_path, dpi=150, bbox_inches='tight')
             plt.close(fig)
@@ -693,10 +694,10 @@ def process_single_video(video_path, output_root, args):
         with open(f"{output_dir}/frame_matches.json", 'w') as f:
             json.dump(matches_output, f, indent=2)
         
-        with open(f"{output_dir}/reference_faces.pkl", 'wb') as f:
-            pickle.dump(reference_faces, f)
+        with open(f"{output_dir}/character_prototypes.pkl", 'wb') as f:
+            pickle.dump(character_prototypes, f)
         
-        summary_report = generate_summary_report(frame_matches, reference_faces)
+        summary_report = generate_summary_report(frame_matches, character_prototypes)
         
         with open(f"{output_dir}/summary_report.txt", 'w') as f:
             f.write(summary_report)
@@ -720,21 +721,21 @@ def process_videos_batch(video_files, output_root, args):
     
     print(f"\nStarting batch processing")
     print(f"Total videos: {total_videos}")
-    print(f"Model: MTCNN + InceptionResnetV1 (VGGFace2 - SOTA)")
+    print(f"Model: buffalo_l + tracklet-based prototypes")
+    print(f"Prototypes per character: {args.k_prototypes}")
+    print(f"Quality filtering: top {args.quality_percentile}%")
     print(f"GPUs: 2")
-    print(f"GPU per task: 0.25")
-    print(f"Max concurrent tasks: 8")
-    print(f"Candidate frames per character: {args.num_candidates}")
-    print(f"Test frames per video: {args.num_test_frames}")
+    print(f"Max concurrent tasks: 16")
     
-    ray.init(num_gpus=2, num_cpus=8)
+    ray.init(num_gpus=2, num_cpus=16)
     
     args_dict = {
         'num_test_frames': args.num_test_frames,
         'sample_rate': args.sample_rate,
         'min_face_size': args.min_face_size,
         'similarity_threshold': args.similarity_threshold,
-        'num_candidates': args.num_candidates
+        'k_prototypes': args.k_prototypes,
+        'quality_percentile': args.quality_percentile
     }
     
     futures = [process_single_video.remote(video_path, output_root, args_dict) for video_path in video_files]
@@ -779,24 +780,17 @@ def process_videos_batch(video_files, output_root, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='SOTA Face Recognition Pipeline using FaceNet')
+    parser = argparse.ArgumentParser(description='Research-Grade Movie Character Recognition Pipeline')
     
-    parser.add_argument('--videos-dir', type=str, default='/mnt/data/data_hub/movies_dataset/videos',
-                        help='Directory containing video files')
-    parser.add_argument('--output-dir', type=str, default='/mnt/data/data_hub/movies_dataset/face_extraction',
-                        help='Root output directory')
-    parser.add_argument('--num-test-frames', type=int, default=150,
-                        help='Number of test frames to generate per video')
-    parser.add_argument('--sample-rate', type=int, default=30,
-                        help='Frame sampling rate for face extraction')
-    parser.add_argument('--min-face-size', type=int, default=50,
-                        help='Minimum face size in pixels')
-    parser.add_argument('--similarity-threshold', type=float, default=0.35,
-                        help='Similarity threshold for face matching')
-    parser.add_argument('--max-folders', type=int, default=None,
-                        help='Maximum number of folders to process')
-    parser.add_argument('--num-candidates', type=int, default=15,
-                        help='Number of candidate frames to evaluate per character')
+    parser.add_argument('--videos-dir', type=str, default='/mnt/data/data_hub/movies_dataset/videos')
+    parser.add_argument('--output-dir', type=str, default='/mnt/data/data_hub/movies_dataset/face_extraction')
+    parser.add_argument('--num-test-frames', type=int, default=150)
+    parser.add_argument('--sample-rate', type=int, default=30)
+    parser.add_argument('--min-face-size', type=int, default=50)
+    parser.add_argument('--similarity-threshold', type=float, default=0.35)
+    parser.add_argument('--max-folders', type=int, default=None)
+    parser.add_argument('--k-prototypes', type=int, default=8)
+    parser.add_argument('--quality-percentile', type=int, default=70)
     
     args = parser.parse_args()
     
