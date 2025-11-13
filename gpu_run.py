@@ -915,7 +915,7 @@ CHARACTER APPEARANCES IN TEST FRAMES:
     return report
 
 
-@ray.remote(num_gpus=0.25, num_cpus=1)
+@ray.remote(num_gpus=0.5, num_cpus=1)
 def process_single_video(video_path, output_root, args):
     try:
         video_name = Path(video_path).stem
@@ -1037,9 +1037,9 @@ def process_videos_batch(video_files, output_root, args):
     print(f"Model: buffalo_l + ADAPTIVE PIPELINE")
     print(f"Auto-tuning: clustering, thresholds, prototypes")
     print(f"GPUs: 2")
-    print(f"Max concurrent tasks: 8")
+    print(f"Max concurrent tasks: 4")
     
-    ray.init(num_gpus=2, num_cpus=8)
+    ray.init(num_gpus=2, num_cpus=4)
     
     args_dict = {
         'num_test_frames': args.num_test_frames,
