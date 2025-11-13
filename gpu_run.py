@@ -357,15 +357,14 @@ def refine_large_clusters(tracklet_embeddings, labels, logger):
         if label != -1:
             cluster_sizes[label] += 1
     
-    # Find clusters that are statistical outliers (way too large)
     sizes = list(cluster_sizes.values())
     if len(sizes) < 3:
         return labels
     
     median_size = np.median(sizes)
     
-    # If a cluster is 10x larger than median, it's probably multiple people
-    outlier_threshold = max(50, median_size * 10)
+    # Very aggressive: split any cluster >30 tracklets or 4x median
+    outlier_threshold = max(30, median_size * 4)
     
     new_labels = labels.copy()
     next_label = max(labels) + 1
@@ -374,23 +373,24 @@ def refine_large_clusters(tracklet_embeddings, labels, logger):
         if size > outlier_threshold:
             logger.info(f"Splitting mega-cluster {cluster_id} ({size} tracklets, threshold={outlier_threshold:.0f})")
             
-            # Get all tracklets in this cluster
             cluster_indices = np.where(labels == cluster_id)[0]
             cluster_embeddings = tracklet_embeddings[cluster_indices]
             
-            # Re-cluster this mega-cluster with tighter eps
             similarity_matrix = cosine_similarity(cluster_embeddings)
             distance_matrix = 1 - similarity_matrix
             distance_matrix = np.clip(distance_matrix, 0, None)
             
-            # Use tight clustering
-            sub_clustering = DBSCAN(eps=0.25, min_samples=2, metric='precomputed')
+            # Very tight clustering for sub-clusters
+            sub_clustering = DBSCAN(eps=0.20, min_samples=2, metric='precomputed')
             sub_labels = sub_clustering.fit_predict(distance_matrix)
             
             # Reassign labels
             for i, sub_label in enumerate(sub_labels):
                 if sub_label != -1:
                     new_labels[cluster_indices[i]] = next_label + sub_label
+                else:
+                    # Keep noise in original cluster
+                    new_labels[cluster_indices[i]] = -1
             
             n_new_clusters = len(set(sub_labels)) - (1 if -1 in sub_labels else 0)
             logger.info(f"  Split into {n_new_clusters} sub-clusters")
@@ -421,12 +421,22 @@ def cluster_tracklets_adaptive(tracklets, logger, total_frames):
     
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     
-    # Refine: split mega-clusters
-    labels = refine_large_clusters(tracklet_embeddings, labels, logger)
+    # Refine: split mega-clusters iteratively
+    max_iterations = 3
+    for iteration in range(max_iterations):
+        labels_before = labels.copy()
+        labels = refine_large_clusters(tracklet_embeddings, labels, logger)
+        
+        # Check if anything changed
+        if np.array_equal(labels, labels_before):
+            break
+        
+        logger.info(f"Refinement iteration {iteration + 1} complete")
+    
     n_clusters_refined = len(set(labels)) - (1 if -1 in labels else 0)
     
     if n_clusters_refined > n_clusters:
-        logger.info(f"Refinement: {n_clusters} → {n_clusters_refined} clusters after splitting mega-clusters")
+        logger.info(f"Final refinement: {n_clusters} → {n_clusters_refined} clusters after splitting mega-clusters")
     
     cluster_sizes = defaultdict(int)
     for label in labels:
