@@ -90,35 +90,58 @@ def compute_quality_score(face_crop, bbox, frame_shape, det_conf, embedding_norm
     gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY) if len(face_crop.shape) == 3 else face_crop
     
     laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-    sharpness = min(laplacian_var / 1000.0, 1.0)
+    sharpness = min(laplacian_var / 2000.0, 1.0)
+    
+    if laplacian_var < 100:
+        sharpness = 0.0
     
     bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
     frame_area = frame_h * frame_w
-    relative_size = min(bbox_area / frame_area, 0.5) * 2.0
+    relative_size = bbox_area / frame_area
+    
+    if relative_size < 0.01:
+        return 0.0
+    
+    size_score = min(relative_size / 0.1, 1.0)
     
     x1, y1, x2, y2 = bbox
-    border_penalty = 0.0
-    margin = 10
+    border_penalty = 1.0
+    margin = 20
     if x1 < margin or y1 < margin or x2 > (frame_w - margin) or y2 > (frame_h - margin):
-        border_penalty = 0.3
+        border_penalty = 0.0
     
     embedding_score = min(embedding_norm / 20.0, 1.0)
     
-    pose_penalty = 0.0
+    pose_penalty = 1.0
     if landmarks is not None:
         yaw = estimate_head_pose_simple(landmarks)
-        if yaw > 25:
-            pose_penalty = 0.4
-        elif yaw > 15:
-            pose_penalty = 0.2
+        if yaw > 30:
+            return 0.0
+        elif yaw > 20:
+            pose_penalty = 0.3
+        elif yaw > 10:
+            pose_penalty = 0.7
+    
+    brightness = gray.mean()
+    if brightness < 40 or brightness > 220:
+        return 0.0
+    
+    brightness_score = 1.0 - abs(brightness - 127.5) / 127.5
+    
+    contrast = gray.std()
+    if contrast < 20:
+        return 0.0
+    contrast_score = min(contrast / 60.0, 1.0)
     
     quality = (
-        0.25 * sharpness +
-        0.20 * relative_size +
-        0.15 * det_conf +
-        0.15 * embedding_score +
-        0.10 * (1.0 - border_penalty) +
-        0.15 * (1.0 - pose_penalty)
+        0.35 * sharpness +
+        0.25 * size_score +
+        0.15 * brightness_score +
+        0.10 * contrast_score +
+        0.05 * det_conf +
+        0.05 * embedding_score +
+        0.025 * border_penalty +
+        0.025 * pose_penalty
     )
     
     return quality
@@ -337,12 +360,16 @@ def farthest_point_sampling(embeddings, qualities, k=5):
     return selected_indices
 
 
-def select_prototype_set(tracklets, labels, tracklet_embeddings, top_quality_percentile=70, k_prototypes=8):
+def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top_quality_percentile=90, k_prototypes=3):
     character_prototypes = {}
     
     unique_labels = set(labels)
     if -1 in unique_labels:
         unique_labels.remove(-1)
+    
+    cap = cv2.VideoCapture(video_path)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
     for label in tqdm(unique_labels, desc="Building prototype sets", leave=False):
         cluster_indices = np.where(labels == label)[0]
@@ -354,28 +381,140 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, top_quality_per
         if not all_detections:
             continue
         
-        qualities = np.array([d['quality_score'] for d in all_detections])
-        quality_threshold = np.percentile(qualities, top_quality_percentile)
+        cluster_centroid = tracklet_embeddings[cluster_indices].mean(axis=0)
         
-        high_quality_detections = [d for d in all_detections if d['quality_score'] >= quality_threshold]
+        candidate_faces = []
         
-        if not high_quality_detections:
-            high_quality_detections = all_detections
+        for det in all_detections:
+            frame_idx = det['frame_idx']
+            bbox = det['bbox']
+            
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            
+            if not ret or frame is None:
+                continue
+            
+            x1, y1, x2, y2 = bbox
+            
+            face_width = x2 - x1
+            face_height = y2 - y1
+            
+            padding_h = int(face_height * 0.3)
+            padding_w = int(face_width * 0.3)
+            
+            x1 = max(0, x1 - padding_w)
+            y1 = max(0, y1 - padding_h)
+            x2 = min(width, x2 + padding_w)
+            y2 = min(height, y2 + padding_h)
+            
+            if x2 <= x1 or y2 <= y1:
+                continue
+            
+            face_crop = frame[y1:y2, x1:x2]
+            
+            if face_crop.size == 0:
+                continue
+            
+            crop_h, crop_w = face_crop.shape[:2]
+            
+            if crop_h < 80 or crop_w < 80:
+                continue
+            
+            gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+            
+            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+            if laplacian_var < 200:
+                continue
+            
+            brightness = gray.mean()
+            if brightness < 60 or brightness > 200:
+                continue
+            
+            contrast = gray.std()
+            if contrast < 30:
+                continue
+            
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = np.sum(edges > 0) / edges.size
+            
+            hsv = cv2.cvtColor(face_crop, cv2.COLOR_BGR2HSV)
+            saturation = hsv[:, :, 1].mean()
+            
+            hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+            hist_norm = hist.ravel() / hist.sum()
+            entropy = -np.sum(hist_norm * np.log2(hist_norm + 1e-7))
+            
+            embedding_dist = np.linalg.norm(det['embedding'] - cluster_centroid)
+            embedding_score = 1.0 / (1.0 + embedding_dist)
+            
+            visual_quality = (
+                0.40 * min(laplacian_var / 1000.0, 1.0) +
+                0.20 * min(edge_density / 0.2, 1.0) +
+                0.15 * (1.0 - abs(brightness - 127.5) / 127.5) +
+                0.15 * min(contrast / 60.0, 1.0) +
+                0.10 * min(saturation / 100.0, 1.0)
+            )
+            
+            final_score = 0.7 * visual_quality + 0.3 * embedding_score
+            
+            candidate_faces.append({
+                'detection': det,
+                'crop': face_crop,
+                'visual_quality': visual_quality,
+                'embedding_score': embedding_score,
+                'final_score': final_score,
+                'frame_idx': frame_idx,
+                'bbox': [x1, y1, x2, y2]
+            })
         
-        hq_embeddings = np.array([d['embedding'] for d in high_quality_detections])
-        hq_qualities = np.array([d['quality_score'] for d in high_quality_detections])
+        if not candidate_faces:
+            continue
         
-        prototype_indices = farthest_point_sampling(hq_embeddings, hq_qualities, min(k_prototypes, len(hq_embeddings)))
+        candidate_faces.sort(key=lambda x: x['final_score'], reverse=True)
         
-        prototypes = [high_quality_detections[i] for i in prototype_indices]
+        top_candidates = candidate_faces[:min(k_prototypes * 3, len(candidate_faces))]
         
-        character_prototypes[f"character_{label}"] = {
-            'prototypes': prototypes,
-            'mean_embedding': tracklet_embeddings[cluster_indices].mean(axis=0),
-            'num_tracklets': len(cluster_indices),
-            'total_detections': len(all_detections)
-        }
+        selected_prototypes = []
+        selected_embeddings = []
+        
+        if top_candidates:
+            best = top_candidates[0]
+            selected_prototypes.append(best)
+            selected_embeddings.append(best['detection']['embedding'])
+        
+        for candidate in top_candidates[1:]:
+            if len(selected_prototypes) >= k_prototypes:
+                break
+            
+            min_dist = float('inf')
+            for sel_emb in selected_embeddings:
+                dist = np.linalg.norm(candidate['detection']['embedding'] - sel_emb)
+                min_dist = min(min_dist, dist)
+            
+            if min_dist > 0.5:
+                selected_prototypes.append(candidate)
+                selected_embeddings.append(candidate['detection']['embedding'])
+        
+        if selected_prototypes:
+            prototypes_data = []
+            for proto in selected_prototypes:
+                prototypes_data.append({
+                    'frame_idx': proto['frame_idx'],
+                    'bbox': proto['bbox'],
+                    'embedding': proto['detection']['embedding'],
+                    'confidence': proto['detection']['confidence'],
+                    'quality_score': proto['visual_quality']
+                })
+            
+            character_prototypes[f"character_{label}"] = {
+                'prototypes': prototypes_data,
+                'mean_embedding': cluster_centroid,
+                'num_tracklets': len(cluster_indices),
+                'total_detections': len(all_detections)
+            }
     
+    cap.release()
     return character_prototypes
 
 
@@ -692,7 +831,7 @@ def process_single_video(video_path, output_root, args):
         labels, tracklet_embeddings = cluster_tracklets(tracklets, logger, total_frames)
         
         character_prototypes = select_prototype_set(
-            tracklets, labels, tracklet_embeddings,
+            tracklets, labels, tracklet_embeddings, video_path,
             top_quality_percentile=args['quality_percentile'],
             k_prototypes=args['k_prototypes']
         )
@@ -828,8 +967,8 @@ def main():
     parser.add_argument('--min-face-size', type=int, default=50)
     parser.add_argument('--similarity-threshold', type=float, default=0.35)
     parser.add_argument('--max-folders', type=int, default=None)
-    parser.add_argument('--k-prototypes', type=int, default=8)
-    parser.add_argument('--quality-percentile', type=int, default=70)
+    parser.add_argument('--k-prototypes', type=int, default=3)
+    parser.add_argument('--quality-percentile', type=int, default=90)
     
     args = parser.parse_args()
     
