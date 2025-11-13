@@ -409,7 +409,7 @@ def check_color_quality(face_crop):
     return True, "good"
 
 
-def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top_quality_percentile=90, k_prototypes=3):
+def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top_quality_percentile=90, k_prototypes=5):
     character_prototypes = {}
     
     unique_labels = set(labels)
@@ -449,7 +449,7 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
             face_width = x2 - x1
             face_height = y2 - y1
             
-            if face_width < 100 or face_height < 100:
+            if face_width < 60 or face_height < 60:
                 continue
             
             padding_h = int(face_height * 0.25)
@@ -460,7 +460,7 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
             x2 = min(width, x2 + padding_w)
             y2 = min(height, y2 + padding_h)
             
-            margin = 30
+            margin = 15
             if x1 < margin or y1 < margin or x2 > (width - margin) or y2 > (height - margin):
                 continue
             
@@ -474,28 +474,28 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
             
             crop_h, crop_w = face_crop.shape[:2]
             
-            if crop_h < 120 or crop_w < 120:
+            if crop_h < 60 or crop_w < 60:
                 continue
             
             if has_text_overlay(face_crop):
                 continue
             
             color_ok, color_reason = check_color_quality(face_crop)
-            if not color_ok:
+            if not color_ok and color_reason == "too_dark":
                 continue
             
             gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
             
             laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-            if laplacian_var < 300:
+            if laplacian_var < 100:
                 continue
             
             brightness = gray.mean()
-            if brightness < 80 or brightness > 180:
+            if brightness < 50 or brightness > 200:
                 continue
             
             contrast = gray.std()
-            if contrast < 35:
+            if contrast < 20:
                 continue
             
             sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
@@ -503,15 +503,9 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
             edge_mag = np.sqrt(sobelx**2 + sobely**2)
             edge_strength = edge_mag.mean()
             
-            if edge_strength < 20:
-                continue
-            
             hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
             hist_norm = hist.ravel() / hist.sum()
             entropy = -np.sum(hist_norm * np.log2(hist_norm + 1e-7))
-            
-            if entropy < 5.0:
-                continue
             
             hsv = cv2.cvtColor(face_crop, cv2.COLOR_BGR2HSV)
             saturation = hsv[:, :, 1].mean()
@@ -527,7 +521,7 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
                 0.10 * min(entropy / 8.0, 1.0)
             )
             
-            final_score = 0.65 * visual_quality + 0.35 * embedding_score
+            final_score = 0.60 * visual_quality + 0.40 * embedding_score
             
             candidate_faces.append({
                 'detection': det,
@@ -545,7 +539,7 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
         
         candidate_faces.sort(key=lambda x: x['final_score'], reverse=True)
         
-        top_candidates = candidate_faces[:min(k_prototypes * 5, len(candidate_faces))]
+        top_candidates = candidate_faces[:min(k_prototypes * 10, len(candidate_faces))]
         
         selected_prototypes = []
         selected_embeddings = []
@@ -564,7 +558,7 @@ def select_prototype_set(tracklets, labels, tracklet_embeddings, video_path, top
                 dist = np.linalg.norm(candidate['detection']['embedding'] - sel_emb)
                 min_dist = min(min_dist, dist)
             
-            if min_dist > 0.4:
+            if min_dist > 0.3:
                 selected_prototypes.append(candidate)
                 selected_embeddings.append(candidate['detection']['embedding'])
         
@@ -729,6 +723,7 @@ def match_faces_in_frame(frame, character_prototypes, similarity_threshold, app)
         
         best_match = None
         best_similarity = -1
+        all_similarities = {}
         
         for char_id, char_data in character_prototypes.items():
             max_sim = -1
@@ -738,15 +733,19 @@ def match_faces_in_frame(frame, character_prototypes, similarity_threshold, app)
                 similarity = cosine_similarity([embedding], [proto_embedding])[0][0]
                 max_sim = max(max_sim, similarity)
             
-            if max_sim > best_similarity and max_sim > similarity_threshold:
+            all_similarities[char_id] = max_sim
+            
+            if max_sim > best_similarity:
                 best_similarity = max_sim
-                best_match = char_id
+                if max_sim > similarity_threshold:
+                    best_match = char_id
         
         matched_faces.append({
             'bbox': bbox.tolist(),
             'character_id': best_match,
             'confidence': float(face.det_score),
-            'similarity': float(best_similarity) if best_match else 0.0
+            'similarity': float(best_similarity),
+            'all_similarities': {k: float(v) for k, v in all_similarities.items()}
         })
     
     return matched_faces
@@ -1037,9 +1036,9 @@ def main():
     parser.add_argument('--num-test-frames', type=int, default=150)
     parser.add_argument('--sample-rate', type=int, default=30)
     parser.add_argument('--min-face-size', type=int, default=50)
-    parser.add_argument('--similarity-threshold', type=float, default=0.35)
+    parser.add_argument('--similarity-threshold', type=float, default=0.20)
     parser.add_argument('--max-folders', type=int, default=None)
-    parser.add_argument('--k-prototypes', type=int, default=3)
+    parser.add_argument('--k-prototypes', type=int, default=5)
     parser.add_argument('--quality-percentile', type=int, default=90)
     
     args = parser.parse_args()
